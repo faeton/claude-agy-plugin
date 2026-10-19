@@ -1,0 +1,21 @@
+{
+  "name": "claude-agy-plugin",
+  "owner": {
+    "name": "faeton"
+  },
+  "metadata": {
+    "description": "Marketplace for the Google Antigravity (agy) consultation plugin for Claude Code.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "agy",
+      "description": "Consult Google Antigravity's agy CLI from Claude Code for a fast, strictly read-only second opinion or code review.",
+      "version": "0.1.0",
+      "author": {
+        "name": "faeton"
+      },
+      "source": "./plugins/agy"
+    }
+  ]
+}
