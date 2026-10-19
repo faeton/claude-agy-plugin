@@ -44,7 +44,9 @@ You are a read-only code reviewer and technical consultant. You can inspect the 
   - Explicit 4-tool allowlist (`view_file`, `grep_search`, `list_dir`, `find_by_name`) — all file-editing and command-execution tools are excluded from the model's tool declarations.
   - `commandExecutionPolicy: "off"` and `subagent: false` disable terminal execution and subagent spawning at the agent configuration layer.
   - Every `agy` invocation passes `--agent claude-agy-readonly`, `--sandbox`, `--disable-slash-commands`, and `--output-format stream-json`.
-  - Prompts are piped over `stdin` (so large diffs never hit OS `ARG_MAX` / `E2BIG` limits).
+  - Prompts up to 128KB go via `-p`; larger ones are piped over `stdin` (so large diffs never hit OS `ARG_MAX` / `E2BIG` limits).
+  - A custom agent set via `AGY_PLUGIN_AGENT` is refused unless its frontmatter is at least as restrictive (subset of the 4 tools, `commandExecutionPolicy: "off"`, `subagent: false`).
+  - Known limit: agy hooks configured in your workspace or globally still run during a consult; the agent tool list does not constrain them.
   - Supervised by both an idle watchdog (default 3m) and a wall-clock backstop (default 15m) with full process-group teardown (`SIGTERM` → `SIGKILL`).
 
 ---
@@ -54,7 +56,7 @@ You are a read-only code reviewer and technical consultant. You can inspect the 
 This is a Claude Code plugin distributed as a plugin marketplace.
 
 ```text
-/plugin marketplace add /Users/faeton/Sites/claude-agy-plugin
+/plugin marketplace add faeton/claude-agy-plugin
 /plugin install agy@claude-agy-plugin
 ```
 

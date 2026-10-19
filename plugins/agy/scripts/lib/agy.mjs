@@ -16,7 +16,7 @@ export const DEFAULT_TIMEOUT_MS = 15 * 60_000;
 export const DEFAULT_IDLE_MS = 3 * 60_000;
 
 // Prompts up to 128KB are passed via `-p <prompt>` with stdin closed (matching
-// the benchmark harness in ~/scratch/llm-bench/bench.py). Prompts larger than
+// the benchmark harness used to tune this plugin). Prompts larger than
 // 128KB are piped via stdin to avoid OS argv limits (E2BIG at ~256KB on macOS).
 const MAX_ARGV_PROMPT_BYTES = 128_000;
 
@@ -88,6 +88,26 @@ commandExecutionPolicy: "off"
 You are a read-only code reviewer and technical consultant. You can inspect the repository with view_file, grep_search, list_dir, and find_by_name. You cannot run commands or edit files. Answer the user's request directly, accurately, and concisely.
 `;
 
+// Check a custom agent's frontmatter: an explicit tool list that is a subset of
+// READONLY_TOOLS, commands off, no subagents. Returns a reason string or null.
+export function readOnlyAgentProblem(markdown) {
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(markdown)?.[1];
+  if (!fm) return "no YAML frontmatter.";
+  const block = /^tools:\s*\r?\n((?:[ \t]+-[^\n]*\r?\n?)+)/m.exec(fm)?.[1];
+  if (!block) return "no explicit `tools:` list.";
+  const tools = block
+    .split(/\r?\n/)
+    .map((l) => l.replace(/^\s*-\s*/, "").replace(/["']/g, "").trim())
+    .filter(Boolean);
+  const extra = tools.filter((t) => !READONLY_TOOLS.includes(t));
+  if (extra.length) return `non-read-only tool(s): ${extra.join(", ")}.`;
+  if (!/^commandExecutionPolicy:\s*["']?off["']?\s*$/m.test(fm)) {
+    return '`commandExecutionPolicy` is not "off".';
+  }
+  if (!/^subagent:\s*false\s*$/m.test(fm)) return "`subagent` is not false.";
+  return null;
+}
+
 // Ensure the 4-tool read-only agent exists in ~/.gemini/config/agents/.
 // Lives outside the user's repository so it never dirties git status.
 export function ensureReadOnlyAgent() {
@@ -113,6 +133,18 @@ export function ensureReadOnlyAgent() {
         tools: READONLY_TOOLS,
         error: `Custom agent "${READONLY_AGENT_NAME}" not found at ${agentPath}.`,
       };
+    } else {
+      // A custom agent replaces our tool list, so it must be no less restrictive.
+      const problem = readOnlyAgentProblem(readFileSync(agentPath, "utf8"));
+      if (problem) {
+        return {
+          provisioned: false,
+          name: READONLY_AGENT_NAME,
+          path: agentPath,
+          tools: READONLY_TOOLS,
+          error: `Custom agent "${READONLY_AGENT_NAME}" is not read-only: ${problem}`,
+        };
+      }
     }
     return {
       provisioned: true,
@@ -198,24 +230,15 @@ export const SANDBOX_PROFILE = "sandbox";
 const SANDBOX_FAILED = /sandbox could not be applied|failed to apply sandbox|refusing to start with denied paths/i;
 const SANDBOX_REFUSED = /bwrap|bubblewrap|could not enforce its deny list/i;
 const BWRAP_HINT =
-  "On Linux the sandbox needs bubblewrap (`bwrap`). Install it, " +
-  "or put a standalone `bwrap` binary on PATH (e.g. ~/.local/bin), or unset " +
-  "AGY_COMPANION_REQUIRE_SANDBOX to run without the OS sandbox.";
+  "agy could not start its terminal sandbox on this host (on Linux it may need " +
+  "bubblewrap, `bwrap`, on PATH).";
 
+// `--sandbox` is agy's own terminal sandbox with a native per-platform
+// implementation, so it is always requested. Probing for grok's `bwrap`
+// dependency here silently dropped it on Linux hosts that could sandbox fine. A
+// failure to apply it is caught at run time (SANDBOX_FAILED / SANDBOX_REFUSED).
 export function sandboxAvailability() {
-  if (process.platform !== "linux") return { available: true, required: true, warning: null };
-  const required = process.env.AGY_COMPANION_REQUIRE_SANDBOX === "1";
-  const res = spawnSync("bwrap", ["--version"], { stdio: "ignore" });
-  if (required || (!res.error && res.status === 0)) {
-    return { available: !res.error && res.status === 0, required: true, warning: null };
-  }
-  return {
-    available: false,
-    required: false,
-    warning:
-      "Ran without the OS sandbox: bubblewrap (`bwrap`) is not on PATH. " +
-      "agy's agent tools are still limited to the 4 read-only file tools.",
-  };
+  return { available: true, required: true, warning: null };
 }
 
 // Read-only argv shared by consult and review:
@@ -236,7 +259,7 @@ export function readOnlyArgs({ web = true, sandbox = true, agent = READONLY_AGEN
 }
 
 export function getAgyAvailability() {
-  const res = spawnSync(AGY_BIN, ["--version"], { encoding: "utf8" });
+  const res = spawnSync(AGY_BIN, ["--version"], { encoding: "utf8", timeout: MODEL_PROBE_TIMEOUT_MS });
   if (res.error || res.status !== 0) {
     return { available: false, version: null, bin: AGY_BIN };
   }
@@ -521,11 +544,11 @@ export function parseEnvelope(stdout) {
 // Run `agy` under supervision. Resolves (never rejects) with a normalized
 // result so callers can record a clean failure instead of hanging.
 //
-// Notes from ~/scratch/llm-bench/MAC-NOTES.md:
-// - `--print-timeout` defaults to 5m in agy: we always pass `--print-timeout <sec>s`
-//   explicitly matching `timeoutMs` so agy does not self-abort at 5m.
+// Notes from benchmarking agy:
+// - `--print-timeout <sec>s` is always passed
+//   explicitly matching `timeoutMs` so agy and the watchdog agree on the limit.
 // - Prompts <= 128KB are passed via `-p <prompt>` with stdin closed (matching
-//   bench.py); larger prompts (>128KB) are piped over stdin to avoid E2BIG.
+//   the benchmark); larger prompts (>128KB) are piped over stdin to avoid E2BIG.
 export function runAgy(args, options = {}) {
   const {
     prompt,
@@ -630,6 +653,10 @@ export function runAgy(args, options = {}) {
 
     let pending = "";
 
+    // Stateful decoding: a multibyte character split across chunks stays intact.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
     child.stdout.on("data", (buf) => {
       touch();
       const chunk = buf.toString("utf8");
@@ -667,10 +694,10 @@ export function runAgy(args, options = {}) {
       clearTimeout(watchdog);
       if (idleTimer) clearTimeout(idleTimer);
       if (runDir) rmSync(runDir.dir, { recursive: true, force: true });
-      if (killTimer) {
-        clearTimeout(killTimer);
-        await terminateGroups([child.pid], { graceMs });
-      }
+      if (killTimer) clearTimeout(killTimer);
+      // Also after a clean exit: a descendant that closed its pipes can outlive
+      // the leader. No-op when the group is already gone.
+      await terminateGroups([child.pid], { graceMs });
       activeChildren.delete(child);
       resolveRun({ ...result, durationMs: Date.now() - startedAt });
     };

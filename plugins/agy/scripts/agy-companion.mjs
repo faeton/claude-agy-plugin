@@ -581,7 +581,7 @@ async function handleCancel(argv) {
     booleanOptions: ["json"],
   });
   const workspaceRoot = resolveWorkspaceRoot(resolveCwd(options));
-  const job = resolveJob(workspaceRoot, positionals[0]);
+  const job = resolveJob(workspaceRoot, positionals[0], { preferActive: true });
   const { changed, job: latest } = transition(workspaceRoot, job.id, ["queued", "running"], {
     status: "cancelled",
     phase: "cancelled",
