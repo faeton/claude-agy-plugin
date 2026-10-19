@@ -2,6 +2,32 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.2.0] — 2026-10-19
+
+Brings in the grok plugin's 0.6.x speed work, tuned for agy from the same benchmark.
+
+### Added
+
+- **Profiles** `--profile balanced|fast|deep` and `AGY_PLUGIN_PROFILE`: `balanced` (default) = `gemini-4-argon-low`, `fast` = `gemini-3.8-flash-low`, `deep` = `gemini-4-argon-medium`. `AGY_PLUGIN_MODEL` / `AGY_PLUGIN_EFFORT` and `--model` / `--effort` still override.
+- **Reviews inline the full text of changed files** (150 KB budget, `AGY_PLUGIN_INLINE_BYTES`).
+- Job records store the model, profile, effort, tool-call count and agy session id.
+
+### Changed
+
+- **Default model `gemini-4-argon-low`, no `--effort` flag.** Before, runs used agy's own default model at `--effort medium`, the slowest configuration in the benchmark.
+- Review and consult prompts end with a working method (cover every hunk, batch reads, whole functions, skip unrelated code).
+- Wall-clock timeout 15 → 8 minutes; commands, the subagent and the runtime skill pass Bash `timeout: 600000`.
+
+### Fixed
+
+- A timeout reports the tool-call count and last activity instead of "no response".
+- An unfinished run keeps agy's reasoning tail as working notes.
+- `max_turns` / `tool_use` / `pause_turn` / `timeout` stops with only a preamble now fail instead of completing.
+- Effort-support detection accepts a `reasoning_efforts` menu.
+- The companion's exit log no longer records `ok: true` for failed runs.
+- After agy recovers from an interrupted stream, the final `result.response` is used instead of the re-streamed deltas (which held the aborted attempt plus the full answer).
+- Branch reviews batch `git ls-tree` so thousands of changed paths cannot overflow argv.
+
 ## [0.1.0] — 2026-10-19
 
 ### Added

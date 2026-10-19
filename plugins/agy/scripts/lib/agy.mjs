@@ -7,10 +7,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 
-// Wall-clock watchdog (15 minutes). Stalls are caught much earlier by the idle
-// timer below; this is the bounded backstop for a run that keeps talking but
-// never finishes.
-export const DEFAULT_TIMEOUT_MS = 15 * 60_000;
+// Wall-clock watchdog (8 minutes). Under 9 minutes so a foreground run finishes,
+// and saves its result, inside Claude Code's 10-minute Bash cap instead of being
+// moved to the background mid-run. With the default profile a review takes 1-3
+// minutes; stalls are caught much earlier by the idle timer below.
+export const DEFAULT_TIMEOUT_MS = 8 * 60_000;
 
 // Kill a run that has produced NO output at all for this long (3 minutes).
 export const DEFAULT_IDLE_MS = 3 * 60_000;
@@ -51,14 +52,50 @@ export const RUN_DIR_PREFIX = "agy-companion-run-";
 // Upper bound on synchronous `agy` probes.
 const MODEL_PROBE_TIMEOUT_MS = 10_000;
 
-// Reasoning effort sent when the caller does not pass --effort. Override
-// globally with AGY_PLUGIN_EFFORT, or per call with --effort.
-// AGY_PLUGIN_EFFORT=default sends no flag and lets agy pick the model default.
-export const DEFAULT_EFFORT = process.env.AGY_PLUGIN_EFFORT || "medium";
-
 // Model IDs in agy often bake the effort level into the suffix (e.g.
 // `gemini-4-argon-low`, `gemini-4-argon-medium`, `gemini-3.8-flash-low`).
 const MODEL_EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/i;
+
+// The model, chosen as a named profile; effort is baked into agy model ids.
+// Measured on the same planted-bug review prompts as the grok plugin
+// (2026-10-19, agy 1.4.2, with the read-only agent and working-method prompt):
+// argon low found every planted bug in 50-65s and ~2.5 min on a large consult;
+// flash low was about twice as fast but missed or invented bugs on the harder
+// diffs; argon medium took 2-10 minutes for the same recall. With no model
+// default the run inherited agy's own default (and its `--effort medium`), the
+// slow configuration.
+export const PROFILES = {
+  balanced: { model: "gemini-4-argon-low" },
+  fast: { model: "gemini-3.8-flash-low" },
+  deep: { model: "gemini-4-argon-medium" },
+};
+export const DEFAULT_PROFILE = "balanced";
+
+// Precedence, highest first: --model / --effort, --profile, AGY_PLUGIN_MODEL /
+// AGY_PLUGIN_EFFORT, AGY_PLUGIN_PROFILE, then `balanced`. The env vars are read
+// at call time (set them in ~/.claude/settings.json "env"). `default` for a
+// model or effort sends no flag and lets agy pick.
+export function resolveProfile(name) {
+  const n = name || process.env.AGY_PLUGIN_PROFILE || DEFAULT_PROFILE;
+  const p = Object.hasOwn(PROFILES, n) ? PROFILES[n] : null;
+  if (!p) {
+    const src = name ? "--profile" : "AGY_PLUGIN_PROFILE";
+    throw new Error(`Unknown ${src} "${n}" (expected ${Object.keys(PROFILES).join(", ")}).`);
+  }
+  return { name: n, ...p, explicit: Boolean(name) };
+}
+
+// Resolve the model a run uses, or null for "send no --model flag".
+export function resolveModel(model, profile) {
+  const p = resolveProfile(profile);
+  const m = model || (p.explicit ? p.model : process.env.AGY_PLUGIN_MODEL || p.model);
+  return m === "default" ? null : m;
+}
+
+function resolveEffort(effort, profile) {
+  const p = resolveProfile(profile);
+  return effort || (p.explicit ? null : process.env.AGY_PLUGIN_EFFORT || null);
+}
 
 // The custom Markdown-defined read-only agent provisioned into
 // ~/.gemini/config/agents/claude-agy-readonly.md.
@@ -174,9 +211,14 @@ const GOOD_STOP_REASONS = new Set(["success", "ok", "endturn", "stop", "complete
 // The run genuinely failed and any text is not a usable answer.
 const BAD_STOP_REASONS = new Set(["cancelled", "canceled", "refusal", "error", "failed", "aborted"]);
 
-// The run hit a ceiling: whatever text arrived is real but incomplete.
-const TRUNCATED_STOP_REASONS = new Set([
-  "maxtokens",
+// The answer was being written and got cut by the output-token limit: the text
+// is real but incomplete, so it is returned with a warning.
+const TRUNCATED_STOP_REASONS = new Set(["maxtokens"]);
+
+// The model ran out of turns or time, or stopped to call a tool, before it wrote
+// its answer. What text exists is preamble ("I'll review the catch code…"), not
+// a result, so the run fails with the text kept as partial output.
+const UNFINISHED_STOP_REASONS = new Set([
   "maxturns",
   "maxturnrequests",
   "maxturnsreached",
@@ -202,6 +244,12 @@ export function classifyStopReason(stopReason, text, { deniedActions } = {}) {
   }
   if (BAD_STOP_REASONS.has(n)) {
     return { ok: false, errorMessage: `agy stopped early (stopReason=${stopReason}).` };
+  }
+  if (UNFINISHED_STOP_REASONS.has(n)) {
+    return {
+      ok: false,
+      errorMessage: `agy stopped before writing its answer (stopReason=${stopReason}).`,
+    };
   }
   if (TRUNCATED_STOP_REASONS.has(n)) {
     return body
@@ -311,29 +359,34 @@ export function modelSupportsReasoningEffort(modelId) {
   try {
     const cachePath = resolve(AGY_HOME, "models_cache.json");
     const cache = JSON.parse(readFileSync(cachePath, "utf8"));
-    const entry = cache.models?.[modelId];
-    if (!entry) return null;
-    return Boolean(entry.info?.supports_reasoning_effort);
+    // An advertised `reasoning_efforts` menu is support; only an explicit
+    // `supports_reasoning_effort: false` is "unsupported".
+    const info = cache.models?.[modelId]?.info;
+    if (!info) return null;
+    if (Array.isArray(info.reasoning_efforts) && info.reasoning_efforts.length) return true;
+    if (typeof info.supports_reasoning_effort === "boolean") return info.supports_reasoning_effort;
+    return null;
   } catch {
     return null;
   }
 }
 
 // Build the effort-related argv. Returns { args, dropped } where dropped is a
-// message or null.
-// If the caller passed a model ID that already bakes the effort into its suffix
-// (e.g. `gemini-4-argon-low` or `gemini-3.8-flash-low`) and did not pass an
-// explicit `--effort`, omit `--effort` so the model's own suffix is respected.
-export function effortArgs({ effort, reasoningEffort, model }) {
+// message or null. Profiles carry no effort (it is in the model id), so the flag
+// is only sent for an explicit --effort or AGY_PLUGIN_EFFORT, and never when the
+// model id already bakes one in unless --effort was passed explicitly.
+export function effortArgs({ effort, reasoningEffort, model, profile }) {
   const explicit = Boolean(effort || reasoningEffort);
-  if (!explicit && model && MODEL_EFFORT_SUFFIX.test(model)) {
+  const resolvedModel = resolveModel(model, profile);
+  if (!explicit && resolvedModel && MODEL_EFFORT_SUFFIX.test(resolvedModel)) {
     return { args: [], dropped: null };
   }
-  let level = effort || reasoningEffort || DEFAULT_EFFORT;
+  let level = resolveEffort(effort || reasoningEffort, profile);
   if (level === "default") level = null;
   if (!level) return { args: [], dropped: null };
   const targetModel =
-    model || (existsSync(resolve(AGY_HOME, "models_cache.json")) ? detectDefaultModel() : null);
+    resolvedModel ||
+    (existsSync(resolve(AGY_HOME, "models_cache.json")) ? detectDefaultModel() : null);
   const supported = targetModel ? modelSupportsReasoningEffort(targetModel) : null;
   if (supported !== false) return { args: ["--effort", level], dropped: null };
   if (!explicit) return { args: [], dropped: null };
@@ -530,7 +583,10 @@ export function parseEnvelope(stdout) {
 
   if (legacy && !text.length && resultResponse === null) return { ...meta, ...legacy };
   if (sawEvent || text.length || resultResponse !== null) {
-    const combinedText = text.length > 0 ? text.join("") : (resultResponse ?? "");
+    // The result event's response is the final answer. After agy recovers from an
+    // interrupted stream it re-streams the answer, so the joined deltas would hold
+    // the aborted attempt followed by the full one.
+    const combinedText = resultResponse || text.join("");
     return {
       ...meta,
       streamed: true,
@@ -652,6 +708,8 @@ export function runAgy(args, options = {}) {
     touch();
 
     let pending = "";
+    // What the run was doing, so a timeout can say so instead of "no response".
+    const activity = { toolCalls: 0, lastEventAt: null };
 
     // Stateful decoding: a multibyte character split across chunks stays intact.
     child.stdout.setEncoding("utf8");
@@ -661,18 +719,24 @@ export function runAgy(args, options = {}) {
       touch();
       const chunk = buf.toString("utf8");
       stdout += chunk;
-      if (!onProgress) return;
       pending += chunk;
       const lines = pending.split(/\r?\n/);
       pending = lines.pop() ?? "";
       for (const line of lines) {
         const t = line.trim();
         if (!t) continue;
+        let event;
         try {
-          onProgress(JSON.parse(t));
+          event = JSON.parse(t);
         } catch {
-          /* not a json line */
+          continue; /* not a json line */
         }
+        activity.lastEventAt = Date.now();
+        const su = event?.event === "step_update" ? (event.step_update ?? event) : null;
+        if ((su?.step_type === "tool" && su.state === "DONE") || event?.type === "tool_call") {
+          activity.toolCalls++;
+        }
+        onProgress?.(event);
       }
     });
 
@@ -757,7 +821,7 @@ export function runAgy(args, options = {}) {
           `Retry, or lower the request size.`;
       } else if (timedOut) {
         ok = false;
-        errorMessage = `Timed out after ${timeoutMs}ms (no response from agy).`;
+        errorMessage = timeoutMessage(timeoutMs, activity);
       } else if (code !== 0) {
         ok = false;
         errorMessage =
@@ -803,10 +867,26 @@ export function runAgy(args, options = {}) {
         thought: envelope?.thought ?? null,
         stderr,
         errorMessage,
+        toolCalls: activity.toolCalls,
         raw: envelope,
       });
     });
   });
+}
+
+// The wall-clock deadline fired. Say what agy was doing: "no response" was wrong
+// for the common case of a run busy reading files right up to the deadline.
+export function timeoutMessage(timeoutMs, { toolCalls = 0, lastEventAt = null } = {}, now = Date.now()) {
+  const secs = Math.round(timeoutMs / 1000);
+  if (!lastEventAt) {
+    return `Timed out after ${secs}s with no output from agy.`;
+  }
+  const ago = Math.max(0, Math.round((now - lastEventAt) / 1000));
+  return (
+    `Timed out after ${secs}s before agy wrote its answer. It was still working ` +
+    `(${toolCalls} tool call${toolCalls === 1 ? "" : "s"}, last activity ${ago}s ago). ` +
+    `Narrow the question or diff, or raise --timeout-ms.`
+  );
 }
 
 function firstStderrLine(stderr) {

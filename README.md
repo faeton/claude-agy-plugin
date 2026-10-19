@@ -47,7 +47,7 @@ You are a read-only code reviewer and technical consultant. You can inspect the 
   - Prompts up to 128KB go via `-p`; larger ones are piped over `stdin` (so large diffs never hit OS `ARG_MAX` / `E2BIG` limits).
   - A custom agent set via `AGY_PLUGIN_AGENT` is refused unless its frontmatter is at least as restrictive (subset of the 4 tools, `commandExecutionPolicy: "off"`, `subagent: false`).
   - Known limit: agy hooks configured in your workspace or globally still run during a consult; the agent tool list does not constrain them.
-  - Supervised by both an idle watchdog (default 3m) and a wall-clock backstop (default 15m) with full process-group teardown (`SIGTERM` → `SIGKILL`).
+  - Supervised by both an idle watchdog (default 3m) and a wall-clock backstop (default 8m, inside Claude Code's 10-minute Bash cap) with full process-group teardown (`SIGTERM` → `SIGKILL`).
 
 ---
 
@@ -84,11 +84,17 @@ Then check your setup:
 ### Common flags
 
 - `--background` — run as a tracked detached job; read it back with `/agy:status` / `/agy:result`.
-- `--model <id>` — pin a specific model in `agy`.
-- `--effort <low|medium|high|xhigh|max>` — reasoning effort, on `consult`, `review`, and `adversarial-review`. **Defaults to `medium`** (override globally via `AGY_PLUGIN_EFFORT`, or set `AGY_PLUGIN_EFFORT=default` to omit the flag).
+- `--profile balanced|fast|deep` — model preset. **Defaults to `balanced`** (`gemini-4-argon-low`: found every planted bug in about a minute in benchmarks). `fast` is `gemini-3.8-flash-low` (about twice as fast, less reliable on cross-file bugs); `deep` is `gemini-4-argon-medium` (2-10 minutes). Set the default with `AGY_PLUGIN_PROFILE`.
+- `--model <id>` / `--effort <low|medium|high|xhigh|max>` — override the profile (`AGY_PLUGIN_MODEL` / `AGY_PLUGIN_EFFORT` globally; `default` sends no flag). agy model ids carry their effort, so `--effort` is only sent when you pass it or pick a model without a suffix.
 - `--scope auto|working-tree|branch` and `--base <ref>` — for reviews.
-- `--timeout-ms <ms>` — wall-clock backstop (default 15 minutes).
+- `--timeout-ms <ms>` — wall-clock backstop (default 8 minutes).
 - `--idle-ms <ms>` — kill a run that produces no output at all for this long (default 3 minutes; `0` disables).
+
+---
+
+### Review context
+
+Reviews inline the full current text of the changed files next to the diff (150 KB budget, lockfiles and minified files skipped; `AGY_PLUGIN_INLINE_BYTES` changes it), and every prompt ends with a short working method (cover every changed hunk and what depends on it, batch reads, read whole functions, skip unrelated code). Both came from the same benchmark that set the grok plugin's defaults.
 
 ---
 

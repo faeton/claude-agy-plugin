@@ -59,10 +59,10 @@ for (const [reason, text, expected, label] of [
   ["ERROR", TEXT, false, "ERROR status fails"],
   ["refusal", TEXT, false, "refusal fails even with text"],
   ["max_tokens", TEXT, true, "max_tokens kept as truncated"],
-  ["max_turns", TEXT, true, "max_turns kept as truncated"],
+  ["max_turns", TEXT, false, "max_turns before an answer fails (text kept as partial)"],
   ["max_tokens", "", false, "truncated with no text fails"],
   ["a_future_reason", TEXT, true, "unknown reason with text fails OPEN"],
-  ["tool_use", TEXT, true, "tool_use turn kept as truncated"],
+  ["tool_use", TEXT, false, "tool_use turn before an answer fails"],
   ["pause_turn", "", false, "pause_turn with no text fails"],
   ["a_future_reason", "hi", false, "unknown reason without real text fails"],
 ]) {
@@ -318,13 +318,13 @@ async function effortFor(name, req, env = {}) {
   return mod.effortArgs(req);
 }
 let e = await effortFor("default", {});
-check("default effort is medium", e.args.join(" ") === "--effort medium", e);
+check("default profile (argon-low) sends no --effort", e.args.length === 0, e);
 e = await effortFor("explicit", { effort: "high" });
 check("explicit effort wins", e.args.join(" ") === "--effort high", e);
 e = await effortFor("bakedmodel", { model: "gemini-4-argon-low" });
 check("model with baked-in effort suffix (-low) omits implicit --effort", e.args.length === 0, e);
-e = await effortFor("envset", {}, { effort: "low" });
-check("AGY_PLUGIN_EFFORT sets the default", e.args.join(" ") === "--effort low", e);
+e = await effortFor("envset", { model: "default" }, { effort: "low" });
+check("AGY_PLUGIN_EFFORT applies when no suffixed model is chosen", e.args.join(" ") === "--effort low", e);
 e = await effortFor("envdefault", {}, { effort: "default" });
 check("AGY_PLUGIN_EFFORT=default sends no flag", e.args.length === 0 && !e.dropped, e);
 e = await effortFor("alias", { reasoningEffort: "low" });
@@ -383,6 +383,61 @@ try {
 }
 if (survived) process.kill(stubbornPid, "SIGKILL");
 check("SIGTERM-ignoring descendant is killed before the companion exits", !survived, stubbornPid);
+
+// ------------------------------------------------- profiles, timeouts, agents
+
+console.log("\nprofiles, effort, timeout message, custom-agent validation");
+{
+  const m = await import(`${LIB}?case=profiles`);
+  for (const k of ["AGY_PLUGIN_PROFILE", "AGY_PLUGIN_MODEL", "AGY_PLUGIN_EFFORT"]) delete process.env[k];
+  check("default profile is balanced (argon low)", m.resolveModel(null, null) === "gemini-4-argon-low", m.resolveModel(null, null));
+  check("--profile fast picks flash low", m.resolveModel(null, "fast") === "gemini-3.8-flash-low");
+  check("--profile deep picks argon medium", m.resolveModel(null, "deep") === "gemini-4-argon-medium");
+  check("--model overrides the profile", m.resolveModel("x-model", "deep") === "x-model");
+  let threw = false;
+  try { m.resolveProfile("nope"); } catch { threw = true; }
+  check("unknown --profile throws", threw);
+  process.env.AGY_PLUGIN_MODEL = "env-model";
+  check("AGY_PLUGIN_MODEL beats the default profile", m.resolveModel(null, null) === "env-model");
+  check("an explicit --profile beats AGY_PLUGIN_MODEL", m.resolveModel(null, "fast") === "gemini-3.8-flash-low");
+  delete process.env.AGY_PLUGIN_MODEL;
+  const e = m.effortArgs({ effort: null, reasoningEffort: null, model: null, profile: null });
+  check("suffixed profile model sends no --effort", e.args.length === 0, e);
+  const e2 = m.effortArgs({ effort: "high", model: "gemini-4-argon-low" });
+  check("explicit --effort is still sent", e2.args.join(" ") === "--effort high", e2);
+  const t0 = m.timeoutMessage(480_000, { toolCalls: 0, lastEventAt: null });
+  check("timeout with no events says so", /no output from agy/.test(t0), t0);
+  const t1 = m.timeoutMessage(480_000, { toolCalls: 7, lastEventAt: 1_000 }, 31_000);
+  check("timeout reports tool calls and last activity", /7 tool calls, last activity 30s ago/.test(t1), t1);
+  const p = m.readOnlyAgentProblem;
+  check("built-in agent passes validation", p(m.READONLY_AGENT_MARKDOWN) === null);
+  check("agent with a write tool is refused", /write_to_file/.test(p(m.READONLY_AGENT_MARKDOWN.replace("  - find_by_name", "  - find_by_name\n  - write_to_file")) ?? ""));
+  check("agent with commands on is refused", p(m.READONLY_AGENT_MARKDOWN.replace('"off"', '"auto"')) !== null);
+  check("agent without a tools list is refused", p("---\nname: x\n---\nhi") !== null);
+}
+
+r = await runFake(
+  "agy-toolcount",
+  emit([
+    { event: "step_update", step_update: { step_type: "tool", state: "ACTIVE", tool_name: "view_file" } },
+    { event: "step_update", step_update: { step_type: "tool", state: "DONE", tool_name: "view_file" } },
+    { event: "step_update", step_update: { step_type: "tool", state: "DONE", tool_name: "grep_search" } },
+    { event: "step_update", step_update: { text_delta: "done" } },
+    { event: "result", result: { status: "SUCCESS" } },
+  ]),
+);
+check("DONE tool steps are counted", r.toolCalls === 2, r.toolCalls);
+
+r = await runFake(
+  "agy-retried-stream",
+  emit([
+    { event: "step_update", step_update: { text_delta: "### Summ" } },
+    { event: "step_update", step_update: { text_delta: "### Summary\nfull answer" } },
+    { event: "result", result: { status: "SUCCESS", response: "### Summary\nfull answer" } },
+  ]),
+);
+check("result.response wins over deltas re-streamed after a retry", r.text === "### Summary\nfull answer", r.text);
+
 
 // ---------------------------------------------------------------------------
 

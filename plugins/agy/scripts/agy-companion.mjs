@@ -14,10 +14,10 @@
 //
 // Subcommands:
 //   setup [--json]
-//   consult [--background] [--file <p>]... [--model <id>] [--effort <lvl>]
+//   consult [--background] [--file <p>]... [--profile <p>] [--model <id>] [--effort <lvl>]
 //           [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>
 //   review  [--background] [--base <ref>] [--scope auto|working-tree|branch]
-//           [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]
+//           [--profile <p>] [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]
 //   adversarial-review [...same as review...] [focus text]
 //   consult-worker --job-id <id>        (internal: detached background worker)
 //   status [job-id] [--all] [--wait] [--timeout-ms <ms>] [--json]
@@ -46,6 +46,8 @@ import {
   getAgyAuthStatus,
   getAgyAvailability,
   readOnlyArgs,
+  resolveModel,
+  resolveProfile,
   runAgy,
   sandboxAvailability,
   terminateActiveAgy,
@@ -73,6 +75,7 @@ import {
   renderSetup,
   renderStatusTable,
   renderStoredResult,
+  reasoningTail,
 } from "./lib/render.mjs";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
@@ -220,6 +223,7 @@ function parseConsultOptions(argv) {
   const { options, positionals } = parseArgs(normalizeArgv(argv), {
     valueOptions: [
       "model",
+      "profile",
       "effort",
       "reasoning-effort",
       "timeout-ms",
@@ -238,6 +242,7 @@ function parseConsultOptions(argv) {
     json: Boolean(options.json),
     background: Boolean(options.background),
     model: options.model || null,
+    profile: options.profile || null,
     effort: options.effort || null,
     reasoningEffort: options["reasoning-effort"] || null,
     timeoutMs: parseMs(options["timeout-ms"], "timeout-ms", DEFAULT_TIMEOUT_MS),
@@ -263,7 +268,8 @@ async function runConsult(req, progress) {
     ...readOnlyArgs({ web: true, sandbox: sandbox.available || sandbox.required, agent: agent.name }),
     ...eff.args,
   ];
-  if (req.model) args.push("--model", req.model);
+  const model = resolveModel(req.model, req.profile);
+  if (model) args.push("--model", model);
 
   progress?.({ phase: "asking", message: "Sending question to agy…" });
   const result = await runAgy(args, {
@@ -291,11 +297,16 @@ async function runConsult(req, progress) {
       text: result.text,
       stopReason: result.stopReason,
       sessionId: result.sessionId,
+      model,
+      profile: resolveProfile(req.profile).name,
+      effort: eff.args[1] ?? null,
+      toolCalls: result.toolCalls,
       warning: result.warning,
       timedOut: result.timedOut,
       idledOut: result.idledOut,
       errorMessage: result.errorMessage,
       durationMs: result.durationMs,
+      ...(result.ok ? {} : { reasoningTail: reasoningTail(result.thought) || null }),
     },
     rendered: renderConsultResult(result),
   };
@@ -303,6 +314,7 @@ async function runConsult(req, progress) {
 
 async function handleConsult(argv) {
   const req = parseConsultOptions(argv);
+  resolveProfile(req.profile); // a bad --profile fails now, not in a background worker
   if (!req.question) {
     throw new Error('consult needs a question (positional text after "--" or --question "…").');
   }
@@ -338,6 +350,7 @@ function parseReviewOptions(argv) {
       "base",
       "scope",
       "model",
+      "profile",
       "effort",
       "reasoning-effort",
       "timeout-ms",
@@ -354,6 +367,7 @@ function parseReviewOptions(argv) {
     base: options.base || null,
     scope: options.scope || "auto",
     model: options.model || null,
+    profile: options.profile || null,
     effort: options.effort || null,
     reasoningEffort: options["reasoning-effort"] || null,
     timeoutMs: parseMs(options["timeout-ms"], "timeout-ms", DEFAULT_TIMEOUT_MS),
@@ -393,7 +407,8 @@ async function runReview(req, kind, progress) {
     ...readOnlyArgs({ web: false, sandbox: sandbox.available || sandbox.required, agent: agent.name }),
     ...eff.args,
   ];
-  if (req.model) args.push("--model", req.model);
+  const model = resolveModel(req.model, req.profile);
+  if (model) args.push("--model", model);
 
   progress?.({ phase: "reviewing", message: `Reviewing ${target.label}…` });
   const result = await runAgy(args, {
@@ -421,11 +436,17 @@ async function runReview(req, kind, progress) {
       text: result.text,
       target,
       stopReason: result.stopReason,
+      sessionId: result.sessionId,
+      model,
+      profile: resolveProfile(req.profile).name,
+      effort: eff.args[1] ?? null,
+      toolCalls: result.toolCalls,
       warning: result.warning,
       timedOut: result.timedOut,
       idledOut: result.idledOut,
       errorMessage: result.errorMessage,
       durationMs: result.durationMs,
+      ...(result.ok ? {} : { reasoningTail: reasoningTail(result.thought) || null }),
     },
     rendered: renderReviewResult(result, { targetLabel: target.label }),
   };
@@ -433,6 +454,8 @@ async function runReview(req, kind, progress) {
 
 async function handleReview(argv, kind = "review") {
   const req = parseReviewOptions(argv);
+  resolveProfile(req.profile);
+  // Fail on a bad --scope / --base now, before a background job is queued for it.
   ensureGitRepository(req.cwd);
   resolveReviewTarget(req.cwd, { base: req.base, scope: req.scope });
   ensureAgyReady();
@@ -582,6 +605,9 @@ async function handleCancel(argv) {
   });
   const workspaceRoot = resolveWorkspaceRoot(resolveCwd(options));
   const job = resolveJob(workspaceRoot, positionals[0], { preferActive: true });
+  // Record the cancellation first, and only for a job that is still active: a
+  // finished job is left alone (cancel with no id picks the newest job, which
+  // used to rewrite a completed review as cancelled and hide its output).
   const { changed, job: latest } = transition(workspaceRoot, job.id, ["queued", "running"], {
     status: "cancelled",
     phase: "cancelled",
@@ -655,7 +681,8 @@ async function main() {
       default:
         throw new Error(`Unknown subcommand: ${subcommand}`);
     }
-    logEvent({ event: "exit", run_id: runId, ok: true, duration_ms: Date.now() - startedAt });
+    // A handler reports a failed run through process.exitCode, not by throwing.
+    logEvent({ event: "exit", run_id: runId, ok: !process.exitCode, duration_ms: Date.now() - startedAt });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`[agy-companion] ${message}\n`);
@@ -668,15 +695,18 @@ function usage() {
   return [
     "Usage:",
     "  agy-companion.mjs setup [--json]",
-    "  agy-companion.mjs consult [--background] [--file <p>]... [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>",
-    "  agy-companion.mjs review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]",
+    "  agy-companion.mjs consult [--background] [--file <p>]... [--profile <p>] [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>",
+    "  agy-companion.mjs review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--profile <p>] [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]",
     "  agy-companion.mjs adversarial-review [...review flags...] [focus text]",
     "  agy-companion.mjs status [job-id] [--all] [--wait] [--timeout-ms <ms>] [--json]",
     "  agy-companion.mjs result [job-id] [--json]",
     "  agy-companion.mjs cancel [job-id] [--json]",
     "",
-    "  --effort      reasoning effort (default medium, or $AGY_PLUGIN_EFFORT; 'default' = CLI's own).",
-    "  --timeout-ms  wall-clock backstop (default 15m).",
+    "  --profile     balanced (gemini-4-argon-low; default), fast (gemini-3.8-flash-low) or deep",
+    "                (gemini-4-argon-medium). Default $AGY_PLUGIN_PROFILE or balanced.",
+    "  --model       agy model id, overrides the profile ($AGY_PLUGIN_MODEL; 'default' = CLI's own).",
+    "  --effort      reasoning effort, overrides the profile ($AGY_PLUGIN_EFFORT; 'default' = CLI's own).",
+    "  --timeout-ms  wall-clock backstop (default 8m).",
     "  --idle-ms     kill after this long with no output at all (default 3m, 0 disables).",
     "",
   ].join("\n");
