@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Marketplace for the Google Antigravity (agy) consultation plugin for Claude Code.",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "agy",
       "description": "Consult Google Antigravity's agy CLI from Claude Code for a fast, strictly read-only second opinion or code review.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "author": {
         "name": "faeton"
       },

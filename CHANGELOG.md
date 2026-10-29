@@ -2,6 +2,18 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.3.0] — 2026-10-30
+
+### Added
+
+- **Web access, on by default.** Runs use a new agent, `claude-agy-readonly-web`, which adds agy's `search_web` and `read_url_content` to the four file tools, and pass a session-only `--settings` rule allowing `read_url(*)`, because headless agy auto-denies page fetches otherwise.
+- **Web switch:** `--web` / `--no-web` per run, `AGY_PLUGIN_WEB=on|off`, and `/agy:setup --web on|off` (saved for all workspaces in `~/.claude-agy/companion/settings.json`). `/agy:setup` shows the current state and where it comes from.
+- Job records store `web`; progress lines show fetched URLs.
+
+### Fixed
+
+- The `web` argument to `readOnlyArgs` was ignored (`void web`), so consults never had web access despite asking for it.
+
 ## [0.2.0] — 2026-10-19
 
 Brings in the grok plugin's 0.6.x speed work, tuned for agy from the same benchmark.

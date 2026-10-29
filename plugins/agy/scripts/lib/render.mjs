@@ -113,6 +113,9 @@ export function renderSetup(report) {
       `  agent:    ${report.agent.provisioned ? `✓ ${report.agent.name} (${report.agent.tools.join(", ")})` : `⚠ ${report.agent.error || "not provisioned"}`}`,
     );
   }
+  if (report.web) {
+    lines.push(`  web:      ${report.web.web ? "on" : "off"} (${report.web.source})`);
+  }
   if (report.sandbox) {
     lines.push(
       `  sandbox:  ${report.sandbox.available ? "✓ enabled" : "⚠ disabled"}`,

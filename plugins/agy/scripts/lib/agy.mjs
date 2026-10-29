@@ -1,6 +1,6 @@
-// Everything that talks to the `agy` CLI: availability/auth, 4-tool read-only
-// custom agent provisioning, read-only flag construction, and the supervised
-// runner (watchdogs + stream-json envelope parsing).
+// Everything that talks to the `agy` CLI: availability/auth, read-only custom
+// agent provisioning (with or without web tools), read-only flag construction,
+// and the supervised runner (watchdogs + stream-json envelope parsing).
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -97,24 +97,24 @@ function resolveEffort(effort, profile) {
   return effort || (p.explicit ? null : process.env.AGY_PLUGIN_EFFORT || null);
 }
 
-// The custom Markdown-defined read-only agent provisioned into
-// ~/.gemini/config/agents/claude-agy-readonly.md.
-// Trimming agy down to these 4 read-only tools and a short 2-sentence system
-// prompt cuts prompt overhead from ~12.6k+ to ~4.0k input tokens per call
-// (2x-3x faster in tool loops) while enforcing strict read-only behavior
-// (`commandExecutionPolicy: "off"`, `subagent: false`).
+// The custom Markdown-defined read-only agents provisioned into
+// ~/.gemini/config/agents/. Trimming agy down to a few read-only tools and a
+// short 2-sentence system prompt cuts prompt overhead from ~12.6k+ to ~4.0k
+// input tokens per call (2x-3x faster in tool loops) while enforcing strict
+// read-only behavior (`commandExecutionPolicy: "off"`, `subagent: false`).
+// `claude-agy-readonly` has the 4 file tools; `claude-agy-readonly-web` adds
+// agy's `search_web` and `read_url_content` for runs with web access on.
 export const DEFAULT_READONLY_AGENT = "claude-agy-readonly";
-export const READONLY_AGENT_NAME = process.env.AGY_PLUGIN_AGENT || DEFAULT_READONLY_AGENT;
+export const DEFAULT_WEB_AGENT = "claude-agy-readonly-web";
 export const READONLY_TOOLS = ["view_file", "grep_search", "list_dir", "find_by_name"];
+export const WEB_TOOLS = ["search_web", "read_url_content"];
 
-export const READONLY_AGENT_MARKDOWN = `---
-name: ${DEFAULT_READONLY_AGENT}
+function agentMarkdown(name, tools, body) {
+  return `---
+name: ${name}
 description: "Strictly read-only code reviewer and consultation agent for claude-agy-plugin."
 tools:
-  - view_file
-  - grep_search
-  - list_dir
-  - find_by_name
+${tools.map((t) => `  - ${t}`).join("\n")}
 mainAgent: true
 subagent: false
 commandExecutionPolicy: "off"
@@ -122,12 +122,54 @@ commandExecutionPolicy: "off"
 
 # System Prompt
 
-You are a read-only code reviewer and technical consultant. You can inspect the repository with view_file, grep_search, list_dir, and find_by_name. You cannot run commands or edit files. Answer the user's request directly, accurately, and concisely.
+You are a read-only code reviewer and technical consultant. ${body} You cannot run commands or edit files. Answer the user's request directly, accurately, and concisely.
 `;
+}
+
+export const READONLY_AGENT_MARKDOWN = agentMarkdown(
+  DEFAULT_READONLY_AGENT,
+  READONLY_TOOLS,
+  "You can inspect the repository with view_file, grep_search, list_dir, and find_by_name.",
+);
+
+export const WEB_AGENT_MARKDOWN = agentMarkdown(
+  DEFAULT_WEB_AGENT,
+  [...READONLY_TOOLS, ...WEB_TOOLS],
+  "You can inspect the repository with view_file, grep_search, list_dir, and find_by_name, and look things up on the web with search_web and read_url_content.",
+);
+
+// Web access: on unless switched off. Precedence, highest first: --web /
+// --no-web, AGY_PLUGIN_WEB (on/off, 1/0, true/false), the saved
+// `/agy:setup --web on|off` setting, then on.
+const ON = new Set(["1", "on", "true", "yes"]);
+const OFF = new Set(["0", "off", "false", "no"]);
+
+export function parseWebSetting(raw, source) {
+  const v = String(raw).trim().toLowerCase();
+  if (ON.has(v)) return true;
+  if (OFF.has(v)) return false;
+  throw new Error(`${source} must be on or off (got "${raw}").`);
+}
+
+export function resolveWeb(flag, saved) {
+  if (typeof flag === "boolean") return { web: flag, source: "flag" };
+  const env = process.env.AGY_PLUGIN_WEB;
+  if (env !== undefined && env !== "") {
+    return { web: parseWebSetting(env, "AGY_PLUGIN_WEB"), source: "AGY_PLUGIN_WEB" };
+  }
+  if (typeof saved === "boolean") return { web: saved, source: "setup" };
+  return { web: true, source: "default" };
+}
+
+// AGY_PLUGIN_AGENT replaces both built-in agents; it must pass the same check.
+function agentNameFor(web) {
+  return process.env.AGY_PLUGIN_AGENT || (web ? DEFAULT_WEB_AGENT : DEFAULT_READONLY_AGENT);
+}
 
 // Check a custom agent's frontmatter: an explicit tool list that is a subset of
-// READONLY_TOOLS, commands off, no subagents. Returns a reason string or null.
-export function readOnlyAgentProblem(markdown) {
+// READONLY_TOOLS (plus WEB_TOOLS when `web`), commands off, no subagents.
+// Returns a reason string or null.
+export function readOnlyAgentProblem(markdown, { web = false } = {}) {
   const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(markdown)?.[1];
   if (!fm) return "no YAML frontmatter.";
   const block = /^tools:\s*\r?\n((?:[ \t]+-[^\n]*\r?\n?)+)/m.exec(fm)?.[1];
@@ -136,8 +178,14 @@ export function readOnlyAgentProblem(markdown) {
     .split(/\r?\n/)
     .map((l) => l.replace(/^\s*-\s*/, "").replace(/["']/g, "").trim())
     .filter(Boolean);
-  const extra = tools.filter((t) => !READONLY_TOOLS.includes(t));
-  if (extra.length) return `non-read-only tool(s): ${extra.join(", ")}.`;
+  const allowed = web ? [...READONLY_TOOLS, ...WEB_TOOLS] : READONLY_TOOLS;
+  const extra = tools.filter((t) => !allowed.includes(t));
+  if (extra.length) {
+    const webOnly = extra.every((t) => WEB_TOOLS.includes(t));
+    return webOnly
+      ? `web tool(s) with web access off: ${extra.join(", ")}.`
+      : `non-read-only tool(s): ${extra.join(", ")}.`;
+  }
   if (!/^commandExecutionPolicy:\s*["']?off["']?\s*$/m.test(fm)) {
     return '`commandExecutionPolicy` is not "off".';
   }
@@ -145,59 +193,38 @@ export function readOnlyAgentProblem(markdown) {
   return null;
 }
 
-// Ensure the 4-tool read-only agent exists in ~/.gemini/config/agents/.
+// Ensure the read-only agent for this run exists in ~/.gemini/config/agents/.
 // Lives outside the user's repository so it never dirties git status.
-export function ensureReadOnlyAgent() {
+export function ensureReadOnlyAgent({ web = false } = {}) {
+  const name = agentNameFor(web);
+  const builtin =
+    name === DEFAULT_READONLY_AGENT ? READONLY_AGENT_MARKDOWN : name === DEFAULT_WEB_AGENT ? WEB_AGENT_MARKDOWN : null;
+  const tools = web ? [...READONLY_TOOLS, ...WEB_TOOLS] : READONLY_TOOLS;
   const agentsDir = resolve(AGY_CONFIG_HOME, "agents");
-  const agentPath = resolve(agentsDir, `${READONLY_AGENT_NAME}.md`);
+  const agentPath = resolve(agentsDir, `${name}.md`);
+  const fail = (error) => ({ provisioned: false, name, path: agentPath, web, tools, error });
   try {
     mkdirSync(agentsDir, { recursive: true });
-    if (READONLY_AGENT_NAME === DEFAULT_READONLY_AGENT) {
+    if (builtin) {
       let current = null;
       try {
         current = readFileSync(agentPath, "utf8");
       } catch {
         /* does not exist yet */
       }
-      if (current !== READONLY_AGENT_MARKDOWN) {
-        writeFileSync(agentPath, READONLY_AGENT_MARKDOWN, "utf8");
+      if (current !== builtin) {
+        writeFileSync(agentPath, builtin, "utf8");
       }
     } else if (!existsSync(agentPath)) {
-      return {
-        provisioned: false,
-        name: READONLY_AGENT_NAME,
-        path: agentPath,
-        tools: READONLY_TOOLS,
-        error: `Custom agent "${READONLY_AGENT_NAME}" not found at ${agentPath}.`,
-      };
+      return fail(`Custom agent "${name}" not found at ${agentPath}.`);
     } else {
       // A custom agent replaces our tool list, so it must be no less restrictive.
-      const problem = readOnlyAgentProblem(readFileSync(agentPath, "utf8"));
-      if (problem) {
-        return {
-          provisioned: false,
-          name: READONLY_AGENT_NAME,
-          path: agentPath,
-          tools: READONLY_TOOLS,
-          error: `Custom agent "${READONLY_AGENT_NAME}" is not read-only: ${problem}`,
-        };
-      }
+      const problem = readOnlyAgentProblem(readFileSync(agentPath, "utf8"), { web });
+      if (problem) return fail(`Custom agent "${name}" is not read-only: ${problem}`);
     }
-    return {
-      provisioned: true,
-      name: READONLY_AGENT_NAME,
-      path: agentPath,
-      tools: READONLY_TOOLS,
-      error: null,
-    };
+    return { provisioned: true, name, path: agentPath, web, tools, error: null };
   } catch (err) {
-    return {
-      provisioned: false,
-      name: READONLY_AGENT_NAME,
-      path: agentPath,
-      tools: READONLY_TOOLS,
-      error: err.message,
-    };
+    return fail(err.message);
   }
 }
 
@@ -289,18 +316,24 @@ export function sandboxAvailability() {
   return { available: true, required: true, warning: null };
 }
 
+// Session-only agy settings for web runs: headless mode auto-denies
+// `read_url_content` unless a `read_url(...)` rule allows it. Passed via
+// `--settings`, so it is never written to the user's settings.json.
+export const WEB_SETTINGS = JSON.stringify({ permissions: { allow: ["read_url(*)"] } });
+
 // Read-only argv shared by consult and review:
-// - `--agent claude-agy-readonly` restricts agy to 4 read-only tools
-//   (`view_file`, `grep_search`, `list_dir`, `find_by_name`) with
+// - `--agent <name>` restricts agy to the agent's read-only tools (the 4 file
+//   tools, plus `search_web` / `read_url_content` for the web agent) with
 //   `commandExecutionPolicy: "off"`, `subagent: false`, and a short prompt.
+// - `--settings` (web runs only) lets `read_url_content` fetch pages.
 // - `--disable-slash-commands` prevents `/skill` or `/command` expansion in
 //   arbitrary prompt text.
 // - `--sandbox` enables agy's OS sandbox restrictions.
-export function readOnlyArgs({ web = true, sandbox = true, agent = READONLY_AGENT_NAME } = {}) {
-  void web;
+export function readOnlyArgs({ web = false, sandbox = true, agent = agentNameFor(web) } = {}) {
   return [
     "--agent",
     agent,
+    ...(web ? ["--settings", WEB_SETTINGS] : []),
     "--disable-slash-commands",
     ...(sandbox ? ["--sandbox"] : []),
   ];

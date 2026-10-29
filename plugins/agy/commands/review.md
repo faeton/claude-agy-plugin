@@ -1,11 +1,11 @@
 ---
 description: Run an Antigravity (agy) code review against local git state (read-only)
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--profile balanced|fast|deep] [--model <id>] [--effort <level>]'
+argument-hint: '[--wait|--background] [--web|--no-web] [--base <ref>] [--scope auto|working-tree|branch] [--profile balanced|fast|deep] [--model <id>] [--effort <level>]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
-Run an Antigravity (`agy`) code review through the local companion. **Review only** — `agy` runs strictly read-only via the 4-tool `claude-agy-readonly` agent; do not fix issues or apply patches in this turn.
+Run an Antigravity (`agy`) code review through the local companion. **Review only** — `agy` runs strictly read-only via a read-only agent (file tools, plus web search/fetch unless `--no-web`); do not fix issues or apply patches in this turn.
 
 Raw slash-command arguments:
 `$ARGUMENTS`
@@ -23,7 +23,7 @@ Execution mode rules:
   - `Run in background`
 
 Argument handling:
-- Preserve the user's arguments. `--scope`, `--base`, `--profile`, `--model`, `--effort` pass through to the companion.
+- Preserve the user's arguments. `--scope`, `--base`, `--profile`, `--model`, `--effort`, `--web`, `--no-web` pass through to the companion.
 - `/agy:review` does not take focus text. For focused/adversarial framing use `/agy:adversarial-review`.
 
 Shell quoting (required): pass the raw arguments to the companion as ONE single-quoted shell word, written in place of `'<raw arguments>'` below. Escape every `'` inside them as `'\''`. Never paste the arguments unquoted or inside double quotes — `$(...)`, backticks, `;` and globs in a question or focus text would be run by the shell. The companion splits that single word into flags itself.

@@ -262,6 +262,22 @@ export function getConfig(workspaceRoot) {
   return readJson(configPath(workspaceRoot), {});
 }
 
+// Settings that apply to every workspace (e.g. `/agy:setup --web on|off`).
+function globalConfigPath() {
+  return join(ensureDir(ROOT), "settings.json");
+}
+
+export function getGlobalConfig() {
+  return readJson(globalConfigPath(), {});
+}
+
+export function setGlobalConfig(key, value) {
+  const config = getGlobalConfig();
+  config[key] = value;
+  writeJson(globalConfigPath(), config);
+  return config;
+}
+
 export function setConfig(workspaceRoot, key, value) {
   const config = getConfig(workspaceRoot);
   config[key] = value;

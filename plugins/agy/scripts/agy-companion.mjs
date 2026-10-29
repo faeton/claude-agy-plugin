@@ -3,20 +3,21 @@
 //
 // `agy` is used STRICTLY READ-ONLY here: consult and review are second-opinion
 // tools, never mutating agents. Every `agy` invocation provisions and selects
-// our custom Markdown-defined agent `claude-agy-readonly`
-// (`~/.gemini/config/agents/claude-agy-readonly.md`), which restricts `agy` to
-// an explicit 4-tool read-only allowlist (`view_file`, `grep_search`,
-// `list_dir`, `find_by_name`), sets `commandExecutionPolicy: "off"` and
-// `subagent: false`, and trims the system prompt down to 2 sentences (~2x-3x
-// faster responses). Runs also pass `--sandbox`, `--disable-slash-commands`,
+// one of our custom Markdown-defined agents in `~/.gemini/config/agents/`:
+// `claude-agy-readonly-web` when web access is on (the default), or
+// `claude-agy-readonly` with `--no-web`. Both restrict `agy` to an explicit
+// read-only allowlist (`view_file`, `grep_search`, `list_dir`, `find_by_name`,
+// plus `search_web` / `read_url_content` for the web agent), set
+// `commandExecutionPolicy: "off"` and `subagent: false`, and trim the system
+// prompt down to 2 sentences (~2x-3x faster responses). Runs also pass `--sandbox`, `--disable-slash-commands`,
 // and `--output-format stream-json`, bounded by both an idle timer and a
 // wall-clock backstop.
 //
 // Subcommands:
-//   setup [--json]
-//   consult [--background] [--file <p>]... [--profile <p>] [--model <id>] [--effort <lvl>]
+//   setup [--web on|off] [--json]
+//   consult [--background] [--web|--no-web] [--file <p>]... [--profile <p>] [--model <id>] [--effort <lvl>]
 //           [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>
-//   review  [--background] [--base <ref>] [--scope auto|working-tree|branch]
+//   review  [--background] [--web|--no-web] [--base <ref>] [--scope auto|working-tree|branch]
 //           [--profile <p>] [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]
 //   adversarial-review [...same as review...] [focus text]
 //   consult-worker --job-id <id>        (internal: detached background worker)
@@ -44,10 +45,12 @@ import {
   effortArgs,
   ensureReadOnlyAgent,
   getAgyAuthStatus,
+  parseWebSetting,
   getAgyAvailability,
   readOnlyArgs,
   resolveModel,
   resolveProfile,
+  resolveWeb,
   runAgy,
   sandboxAvailability,
   terminateActiveAgy,
@@ -65,7 +68,15 @@ import {
   nowIso,
   transition,
 } from "./lib/jobs.mjs";
-import { ROOT, listJobs, pidMatches, readJobFile, resolveWorkspaceRoot } from "./lib/state.mjs";
+import {
+  ROOT,
+  getGlobalConfig,
+  listJobs,
+  pidMatches,
+  readJobFile,
+  resolveWorkspaceRoot,
+  setGlobalConfig,
+} from "./lib/state.mjs";
 import {
   renderCancel,
   renderConsultResult,
@@ -154,6 +165,7 @@ function streamPhase(event) {
         params?.Query ||
         params?.DirectoryPath ||
         params?.Pattern ||
+        params?.Url ||
         "";
       const label = detail ? `${name} ${detail}` : name;
       return { message: `→ ${shorten(label, 70)}` };
@@ -183,22 +195,30 @@ function streamPhase(event) {
 
 async function handleSetup(argv) {
   const { options } = parseArgs(normalizeArgv(argv), {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "web"],
     booleanOptions: ["json"],
   });
+  if (options.web !== undefined) {
+    setGlobalConfig("web", parseWebSetting(options.web, "--web"));
+  }
+  const web = resolveWeb(null, getGlobalConfig().web);
   const agy = getAgyAvailability();
   const auth = agy.available ? getAgyAuthStatus() : { loggedIn: false };
-  const agent = ensureReadOnlyAgent();
+  // Provision both agents so a later --web / --no-web run finds its agent ready.
+  const other = ensureReadOnlyAgent({ web: !web.web });
+  const agent = ensureReadOnlyAgent({ web: web.web });
   const nextSteps = [];
   if (!agy.available) {
     nextSteps.push("Install the Google Antigravity CLI (`agy`) and ensure it is on your PATH (e.g. ~/.local/bin/agy).");
   } else if (!auth.loggedIn) {
     nextSteps.push("Run `!agy` in your terminal to complete initial sign-in.");
   }
-  if (!agent.provisioned) {
-    nextSteps.push(
-      `Ensure ~/.gemini/config/agents is writable so the 4-tool read-only agent (${agent.name}) can be provisioned: ${agent.error}`,
-    );
+  for (const a of [agent, other]) {
+    if (!a.provisioned) {
+      nextSteps.push(
+        `Ensure ~/.gemini/config/agents is writable so the read-only agent (${a.name}) can be provisioned: ${a.error}`,
+      );
+    }
   }
   const sandbox = sandboxAvailability();
   if (!sandbox.available) {
@@ -213,7 +233,7 @@ async function handleSetup(argv) {
     auth.loggedIn &&
     agent.provisioned &&
     (sandbox.available || !sandbox.required);
-  const report = { ready, agy, auth, agent, sandbox, nextSteps };
+  const report = { ready, agy, auth, agent, web, sandbox, nextSteps };
   out(report, options.json, renderSetup(report));
 }
 
@@ -232,7 +252,7 @@ function parseConsultOptions(argv) {
       "question",
     ],
     repeatable: ["file"],
-    booleanOptions: ["json", "background", "wait"],
+    booleanOptions: ["json", "background", "wait", "web", "no-web"],
     aliasMap: { m: "model" },
   });
   const cwd = resolveCwd(options);
@@ -248,13 +268,15 @@ function parseConsultOptions(argv) {
     timeoutMs: parseMs(options["timeout-ms"], "timeout-ms", DEFAULT_TIMEOUT_MS),
     idleMs: parseMs(options["idle-ms"], "idle-ms", DEFAULT_IDLE_MS, { allowZero: true }),
     files: options.file ?? [],
+    web: webFlag(options),
     question,
   };
 }
 
 async function runConsult(req, progress) {
   const prompt = buildConsultPrompt({ question: req.question, files: req.files, cwd: req.cwd });
-  const agent = ensureReadOnlyAgent();
+  const { web } = resolveWeb(req.web, getGlobalConfig().web);
+  const agent = ensureReadOnlyAgent({ web });
   if (!agent.provisioned) {
     throw new Error(`Could not provision read-only agy agent (${agent.name}): ${agent.error}`);
   }
@@ -265,13 +287,13 @@ async function runConsult(req, progress) {
   const args = [
     "--output-format",
     "stream-json",
-    ...readOnlyArgs({ web: true, sandbox: sandbox.available || sandbox.required, agent: agent.name }),
+    ...readOnlyArgs({ web, sandbox: sandbox.available || sandbox.required, agent: agent.name }),
     ...eff.args,
   ];
   const model = resolveModel(req.model, req.profile);
   if (model) args.push("--model", model);
 
-  progress?.({ phase: "asking", message: "Sending question to agy…" });
+  progress?.({ phase: "asking", message: `Sending question to agy (web ${web ? "on" : "off"})…` });
   const result = await runAgy(args, {
     prompt,
     cwd: req.cwd,
@@ -300,6 +322,7 @@ async function runConsult(req, progress) {
       model,
       profile: resolveProfile(req.profile).name,
       effort: eff.args[1] ?? null,
+      web,
       toolCalls: result.toolCalls,
       warning: result.warning,
       timedOut: result.timedOut,
@@ -357,7 +380,7 @@ function parseReviewOptions(argv) {
       "idle-ms",
       "cwd",
     ],
-    booleanOptions: ["json", "background", "wait"],
+    booleanOptions: ["json", "background", "wait", "web", "no-web"],
     aliasMap: { m: "model" },
   });
   return {
@@ -372,6 +395,7 @@ function parseReviewOptions(argv) {
     reasoningEffort: options["reasoning-effort"] || null,
     timeoutMs: parseMs(options["timeout-ms"], "timeout-ms", DEFAULT_TIMEOUT_MS),
     idleMs: parseMs(options["idle-ms"], "idle-ms", DEFAULT_IDLE_MS, { allowZero: true }),
+    web: webFlag(options),
     focusText: positionals.join(" ").trim(),
   };
 }
@@ -390,7 +414,8 @@ async function runReview(req, kind, progress) {
       rendered: "[agy] No changes detected to review.\n",
     };
   }
-  const agent = ensureReadOnlyAgent();
+  const { web } = resolveWeb(req.web, getGlobalConfig().web);
+  const agent = ensureReadOnlyAgent({ web });
   if (!agent.provisioned) {
     throw new Error(`Could not provision read-only agy agent (${agent.name}): ${agent.error}`);
   }
@@ -404,13 +429,13 @@ async function runReview(req, kind, progress) {
   const args = [
     "--output-format",
     "stream-json",
-    ...readOnlyArgs({ web: false, sandbox: sandbox.available || sandbox.required, agent: agent.name }),
+    ...readOnlyArgs({ web, sandbox: sandbox.available || sandbox.required, agent: agent.name }),
     ...eff.args,
   ];
   const model = resolveModel(req.model, req.profile);
   if (model) args.push("--model", model);
 
-  progress?.({ phase: "reviewing", message: `Reviewing ${target.label}…` });
+  progress?.({ phase: "reviewing", message: `Reviewing ${target.label} (web ${web ? "on" : "off"})…` });
   const result = await runAgy(args, {
     prompt,
     cwd: req.cwd,
@@ -440,6 +465,7 @@ async function runReview(req, kind, progress) {
       model,
       profile: resolveProfile(req.profile).name,
       effort: eff.args[1] ?? null,
+      web,
       toolCalls: result.toolCalls,
       warning: result.warning,
       timedOut: result.timedOut,
@@ -634,6 +660,16 @@ async function handleCancel(argv) {
 
 // ---------- shared ----------
 
+// --web / --no-web, or null to fall through to AGY_PLUGIN_WEB / the saved setting.
+function webFlag(options) {
+  if (options.web !== undefined && options["no-web"] !== undefined) {
+    throw new Error("Pass either --web or --no-web, not both.");
+  }
+  if (options["no-web"] !== undefined) return !options["no-web"];
+  if (options.web !== undefined) return options.web;
+  return null;
+}
+
 function ensureAgyReady() {
   const agy = getAgyAvailability();
   if (!agy.available) {
@@ -694,9 +730,9 @@ async function main() {
 function usage() {
   return [
     "Usage:",
-    "  agy-companion.mjs setup [--json]",
-    "  agy-companion.mjs consult [--background] [--file <p>]... [--profile <p>] [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>",
-    "  agy-companion.mjs review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--profile <p>] [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]",
+    "  agy-companion.mjs setup [--web on|off] [--json]",
+    "  agy-companion.mjs consult [--background] [--web|--no-web] [--file <p>]... [--profile <p>] [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>",
+    "  agy-companion.mjs review [--background] [--web|--no-web] [--base <ref>] [--scope auto|working-tree|branch] [--profile <p>] [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]",
     "  agy-companion.mjs adversarial-review [...review flags...] [focus text]",
     "  agy-companion.mjs status [job-id] [--all] [--wait] [--timeout-ms <ms>] [--json]",
     "  agy-companion.mjs result [job-id] [--json]",
@@ -706,6 +742,8 @@ function usage() {
     "                (gemini-4-argon-medium). Default $AGY_PLUGIN_PROFILE or balanced.",
     "  --model       agy model id, overrides the profile ($AGY_PLUGIN_MODEL; 'default' = CLI's own).",
     "  --effort      reasoning effort, overrides the profile ($AGY_PLUGIN_EFFORT; 'default' = CLI's own).",
+    "  --web         let agy use search_web / read_url_content (default on). --no-web turns it off",
+    "                for one run; setup --web on|off saves the default; $AGY_PLUGIN_WEB overrides that.",
     "  --timeout-ms  wall-clock backstop (default 8m).",
     "  --idle-ms     kill after this long with no output at all (default 3m, 0 disables).",
     "",

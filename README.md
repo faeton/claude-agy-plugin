@@ -39,13 +39,15 @@ commandExecutionPolicy: "off"
 You are a read-only code reviewer and technical consultant. You can inspect the repository with view_file, grep_search, list_dir, and find_by_name. You cannot run commands or edit files. Answer the user's request directly, accurately, and concisely.
 ```
 
+With web access on (the default), runs use a sibling agent, `claude-agy-readonly-web` (`~/.gemini/config/agents/claude-agy-readonly-web.md`), with the same four tools plus agy's `search_web` and `read_url_content`. See [Web access](#web-access).
+
 - **Trimming `agy` down to 4 read-only tools and a short 2-sentence system prompt cuts input token overhead by ~85% (~3.9k tokens instead of ~25k+), roughly halving to tripling its speed.**
 - **Defense in depth:**
   - Explicit 4-tool allowlist (`view_file`, `grep_search`, `list_dir`, `find_by_name`) — all file-editing and command-execution tools are excluded from the model's tool declarations.
   - `commandExecutionPolicy: "off"` and `subagent: false` disable terminal execution and subagent spawning at the agent configuration layer.
-  - Every `agy` invocation passes `--agent claude-agy-readonly`, `--sandbox`, `--disable-slash-commands`, and `--output-format stream-json`.
+  - Every `agy` invocation passes `--agent claude-agy-readonly` (or `claude-agy-readonly-web`), `--sandbox`, `--disable-slash-commands`, and `--output-format stream-json`.
   - Prompts up to 128KB go via `-p`; larger ones are piped over `stdin` (so large diffs never hit OS `ARG_MAX` / `E2BIG` limits).
-  - A custom agent set via `AGY_PLUGIN_AGENT` is refused unless its frontmatter is at least as restrictive (subset of the 4 tools, `commandExecutionPolicy: "off"`, `subagent: false`).
+  - A custom agent set via `AGY_PLUGIN_AGENT` is refused unless its frontmatter is at least as restrictive (subset of the 4 tools, plus the 2 web tools when web access is on; `commandExecutionPolicy: "off"`, `subagent: false`).
   - Known limit: agy hooks configured in your workspace or globally still run during a consult; the agent tool list does not constrain them.
   - Supervised by both an idle watchdog (default 3m) and a wall-clock backstop (default 8m, inside Claude Code's 10-minute Bash cap) with full process-group teardown (`SIGTERM` → `SIGKILL`).
 
@@ -79,16 +81,32 @@ Then check your setup:
 | `/agy:status [job-id]` | List recent jobs, or show one job (add `--wait` to block until done). |
 | `/agy:result [job-id]` | Print the stored final output of a finished job. |
 | `/agy:cancel [job-id]` | Cancel a running background job (kills `agy`'s process group cleanly). |
-| `/agy:setup` | Check that `agy` is installed, authenticated, and provisioned with `claude-agy-readonly`. |
+| `/agy:setup [--web on\|off]` | Check that `agy` is installed, authenticated, and provisioned with the read-only agents. `--web on\|off` saves the web-access default. |
 
 ### Common flags
 
 - `--background` — run as a tracked detached job; read it back with `/agy:status` / `/agy:result`.
 - `--profile balanced|fast|deep` — model preset. **Defaults to `balanced`** (`gemini-4-argon-low`: found every planted bug in about a minute in benchmarks). `fast` is `gemini-3.8-flash-low` (about twice as fast, less reliable on cross-file bugs); `deep` is `gemini-4-argon-medium` (2-10 minutes). Set the default with `AGY_PLUGIN_PROFILE`.
 - `--model <id>` / `--effort <low|medium|high|xhigh|max>` — override the profile (`AGY_PLUGIN_MODEL` / `AGY_PLUGIN_EFFORT` globally; `default` sends no flag). agy model ids carry their effort, so `--effort` is only sent when you pass it or pick a model without a suffix.
+- `--web` / `--no-web` — turn web search and page fetching on or off for one run (see below).
 - `--scope auto|working-tree|branch` and `--base <ref>` — for reviews.
 - `--timeout-ms <ms>` — wall-clock backstop (default 8 minutes).
 - `--idle-ms <ms>` — kill a run that produces no output at all for this long (default 3 minutes; `0` disables).
+
+---
+
+### Web access
+
+On by default for consults and reviews. agy gets `search_web` and `read_url_content`, and the run passes `--settings '{"permissions":{"allow":["read_url(*)"]}}'` because headless agy otherwise auto-denies page fetches. That rule lives only for the run and is never written to your agy `settings.json`.
+
+Precedence, highest first:
+
+1. `--web` / `--no-web` on the command.
+2. `AGY_PLUGIN_WEB=on|off` (e.g. in `~/.claude/settings.json` `"env"`).
+3. `/agy:setup --web on|off`, saved in `~/.claude-agy/companion/settings.json` for every workspace.
+4. On.
+
+The trade-off: a page agy reads, or text planted in the code under review, could steer it into fetching a URL that carries repository content in the query string. agy still cannot write files or run commands, but if you review untrusted code, use `--no-web` or switch the default off.
 
 ---
 

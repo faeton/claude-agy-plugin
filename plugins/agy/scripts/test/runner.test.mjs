@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Tests for the agy runner: status/stop-reason classification, stream-json
-// parsing, 4-tool read-only agent provisioning, prompt delivery via stdin,
+// parsing, read-only agent provisioning (with and without web tools), prompt delivery via stdin,
 // watchdogs, process-group teardown, read-only argv, and effort selection.
 //
 // No dependencies and no network: a shell script stands in for the `agy` binary
@@ -264,9 +264,9 @@ r = await runFake(
 );
 check("empty response with denied_actions fails and names the denied tool", r.ok === false && /run_command/.test(r.errorMessage || ""), r);
 
-// ------------------------------------------------ 4-tool read-only agent & argv
+// ------------------------------------------------ read-only agents & argv
 
-console.log("\n4-tool read-only custom agent & flags");
+console.log("\nread-only custom agents & flags");
 
 const configHome = join(DIR, "gemini-config");
 process.env.AGY_CONFIG_HOME = configHome;
@@ -282,13 +282,32 @@ check(
 );
 check("provisioned agent disables commands and subagents", agentContent.includes('commandExecutionPolicy: "off"') && agentContent.includes("subagent: false"), agentContent);
 check("provisioned agent has a short trimmed system prompt (<600 chars)", agentContent.length < 600, agentContent.length);
+check("offline agent has no web tools", !/search_web|read_url_content/.test(agentContent), agentContent);
 
-const consultArgs = agyMod.readOnlyArgs({ web: true });
-const reviewArgs = agyMod.readOnlyArgs({ web: false });
+const webReport = agyMod.ensureReadOnlyAgent({ web: true });
+check("web run provisions claude-agy-readonly-web", webReport.provisioned && webReport.name === "claude-agy-readonly-web", webReport);
+const webContent = readFileSync(webReport.path, "utf8");
+check(
+  "web agent adds only search_web and read_url_content",
+  /- search_web\n {2}- read_url_content\n/.test(webContent) && agyMod.readOnlyAgentProblem(webContent, { web: true }) === null,
+  webContent,
+);
+check("web agent still disables commands and subagents", webContent.includes('commandExecutionPolicy: "off"') && webContent.includes("subagent: false"), webContent);
+check("web agent prompt stays short (<700 chars)", webContent.length < 700, webContent.length);
+
+const webArgs = agyMod.readOnlyArgs({ web: true });
+const offlineArgs = agyMod.readOnlyArgs({ web: false });
 const valueOf = (args, flag) => args[args.indexOf(flag) + 1];
-check("readOnlyArgs selects claude-agy-readonly agent", valueOf(consultArgs, "--agent") === "claude-agy-readonly", consultArgs);
-check("readOnlyArgs disables slash commands", consultArgs.includes("--disable-slash-commands"), consultArgs);
-check("readOnlyArgs enables --sandbox by default", reviewArgs.includes("--sandbox"), reviewArgs);
+check("web run selects claude-agy-readonly-web", valueOf(webArgs, "--agent") === "claude-agy-readonly-web", webArgs);
+check("offline run selects claude-agy-readonly", valueOf(offlineArgs, "--agent") === "claude-agy-readonly", offlineArgs);
+check(
+  "web run allows read_url for this session only",
+  JSON.parse(valueOf(webArgs, "--settings")).permissions.allow.join() === "read_url(*)",
+  webArgs,
+);
+check("offline run passes no --settings", !offlineArgs.includes("--settings"), offlineArgs);
+check("readOnlyArgs disables slash commands", webArgs.includes("--disable-slash-commands"), webArgs);
+check("readOnlyArgs enables --sandbox by default", offlineArgs.includes("--sandbox"), offlineArgs);
 check("unsandboxed fallback omits --sandbox", !agyMod.readOnlyArgs({ sandbox: false }).includes("--sandbox"));
 
 // -------------------------------------------------------------------- effort
@@ -414,6 +433,23 @@ console.log("\nprofiles, effort, timeout message, custom-agent validation");
   check("agent with a write tool is refused", /write_to_file/.test(p(m.READONLY_AGENT_MARKDOWN.replace("  - find_by_name", "  - find_by_name\n  - write_to_file")) ?? ""));
   check("agent with commands on is refused", p(m.READONLY_AGENT_MARKDOWN.replace('"off"', '"auto"')) !== null);
   check("agent without a tools list is refused", p("---\nname: x\n---\nhi") !== null);
+  check("web agent is refused with web off", /web tool/.test(p(m.WEB_AGENT_MARKDOWN) ?? ""));
+
+  delete process.env.AGY_PLUGIN_WEB;
+  check("web is on by default", m.resolveWeb(null, undefined).web === true);
+  check("saved setup setting turns web off", m.resolveWeb(null, false).web === false);
+  process.env.AGY_PLUGIN_WEB = "off";
+  check("AGY_PLUGIN_WEB beats the saved setting", m.resolveWeb(null, true).web === false);
+  check("--web beats AGY_PLUGIN_WEB", m.resolveWeb(true, true).web === true);
+  process.env.AGY_PLUGIN_WEB = "maybe";
+  let badWebThrew = false;
+  try {
+    m.resolveWeb(null, undefined);
+  } catch {
+    badWebThrew = true;
+  }
+  check("a bad AGY_PLUGIN_WEB is an error", badWebThrew);
+  delete process.env.AGY_PLUGIN_WEB;
 }
 
 r = await runFake(
