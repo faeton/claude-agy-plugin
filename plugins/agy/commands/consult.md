@@ -5,7 +5,7 @@ disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), AskUserQuestion
 ---
 
-Ask Antigravity (`agy`) a question via the local companion. **Consultation only** — `agy` runs strictly read-only via a read-only agent (file tools, plus web search/fetch unless `--no-web`) and cannot edit files; do not act on its answer in this turn.
+Ask Antigravity (`agy`) a question via the local companion. **Consultation only** — `agy` runs strictly read-only via a read-only agent (file tools only, plus web search/fetch when web access is on) and cannot edit files; do not act on its answer in this turn.
 
 Raw slash-command arguments:
 `$ARGUMENTS`
@@ -13,7 +13,7 @@ Raw slash-command arguments:
 Argument shape:
 - Everything after `--` is the question text.
 - `--file <path>` (repeatable) attaches a file as context. Resolve paths relative to the current working directory.
-- `--profile`, `--model`, `--effort`, `--reasoning-effort`, `--web`, `--no-web` are passed through to `agy`. Web access is on by default; `--no-web` keeps the run offline.
+- `--profile`, `--model`, `--effort`, `--reasoning-effort`, `--web`, `--no-web` are passed through to `agy`. Web access is off by default; `--web` turns it on for this run, `--no-web` forces it off.
 
 If you cannot tell the question from the flags (no `--` separator and it is ambiguous), use `AskUserQuestion` once to clarify.
 

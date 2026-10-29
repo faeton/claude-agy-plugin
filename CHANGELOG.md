@@ -2,6 +2,12 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.3.1] — 2026-10-30
+
+### Changed
+
+- **Web access is off by default.** Turn it on per run with `--web`, for every run with `/agy:setup --web on`, or with `AGY_PLUGIN_WEB=on`. The README's "Web access" section shows how.
+
 ## [0.3.0] — 2026-10-30
 
 ### Added

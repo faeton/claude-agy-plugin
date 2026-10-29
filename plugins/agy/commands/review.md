@@ -5,7 +5,7 @@ disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
-Run an Antigravity (`agy`) code review through the local companion. **Review only** — `agy` runs strictly read-only via a read-only agent (file tools, plus web search/fetch unless `--no-web`); do not fix issues or apply patches in this turn.
+Run an Antigravity (`agy`) code review through the local companion. **Review only** — `agy` runs strictly read-only via a read-only agent (file tools only, plus web search/fetch when web access is on); do not fix issues or apply patches in this turn.
 
 Raw slash-command arguments:
 `$ARGUMENTS`

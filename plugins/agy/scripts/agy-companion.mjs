@@ -4,8 +4,8 @@
 // `agy` is used STRICTLY READ-ONLY here: consult and review are second-opinion
 // tools, never mutating agents. Every `agy` invocation provisions and selects
 // one of our custom Markdown-defined agents in `~/.gemini/config/agents/`:
-// `claude-agy-readonly-web` when web access is on (the default), or
-// `claude-agy-readonly` with `--no-web`. Both restrict `agy` to an explicit
+// `claude-agy-readonly` by default, or `claude-agy-readonly-web` when web
+// access is switched on (`--web`, AGY_PLUGIN_WEB, `/agy:setup --web on`). Both restrict `agy` to an explicit
 // read-only allowlist (`view_file`, `grep_search`, `list_dir`, `find_by_name`,
 // plus `search_web` / `read_url_content` for the web agent), set
 // `commandExecutionPolicy: "off"` and `subagent: false`, and trim the system
@@ -742,7 +742,7 @@ function usage() {
     "                (gemini-4-argon-medium). Default $AGY_PLUGIN_PROFILE or balanced.",
     "  --model       agy model id, overrides the profile ($AGY_PLUGIN_MODEL; 'default' = CLI's own).",
     "  --effort      reasoning effort, overrides the profile ($AGY_PLUGIN_EFFORT; 'default' = CLI's own).",
-    "  --web         let agy use search_web / read_url_content (default on). --no-web turns it off",
+    "  --web         let agy use search_web / read_url_content (default off). --no-web turns it off",
     "                for one run; setup --web on|off saves the default; $AGY_PLUGIN_WEB overrides that.",
     "  --timeout-ms  wall-clock backstop (default 8m).",
     "  --idle-ms     kill after this long with no output at all (default 3m, 0 disables).",

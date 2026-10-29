@@ -138,9 +138,9 @@ export const WEB_AGENT_MARKDOWN = agentMarkdown(
   "You can inspect the repository with view_file, grep_search, list_dir, and find_by_name, and look things up on the web with search_web and read_url_content.",
 );
 
-// Web access: on unless switched off. Precedence, highest first: --web /
+// Web access: off unless switched on. Precedence, highest first: --web /
 // --no-web, AGY_PLUGIN_WEB (on/off, 1/0, true/false), the saved
-// `/agy:setup --web on|off` setting, then on.
+// `/agy:setup --web on|off` setting, then off.
 const ON = new Set(["1", "on", "true", "yes"]);
 const OFF = new Set(["0", "off", "false", "no"]);
 
@@ -158,7 +158,7 @@ export function resolveWeb(flag, saved) {
     return { web: parseWebSetting(env, "AGY_PLUGIN_WEB"), source: "AGY_PLUGIN_WEB" };
   }
   if (typeof saved === "boolean") return { web: saved, source: "setup" };
-  return { web: true, source: "default" };
+  return { web: false, source: "default" };
 }
 
 // AGY_PLUGIN_AGENT replaces both built-in agents; it must pass the same check.

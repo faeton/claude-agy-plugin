@@ -39,7 +39,7 @@ commandExecutionPolicy: "off"
 You are a read-only code reviewer and technical consultant. You can inspect the repository with view_file, grep_search, list_dir, and find_by_name. You cannot run commands or edit files. Answer the user's request directly, accurately, and concisely.
 ```
 
-With web access on (the default), runs use a sibling agent, `claude-agy-readonly-web` (`~/.gemini/config/agents/claude-agy-readonly-web.md`), with the same four tools plus agy's `search_web` and `read_url_content`. See [Web access](#web-access).
+With web access switched on (off by default), runs use a sibling agent, `claude-agy-readonly-web` (`~/.gemini/config/agents/claude-agy-readonly-web.md`), with the same four tools plus agy's `search_web` and `read_url_content`. See [Web access](#web-access).
 
 - **Trimming `agy` down to 4 read-only tools and a short 2-sentence system prompt cuts input token overhead by ~85% (~3.9k tokens instead of ~25k+), roughly halving to tripling its speed.**
 - **Defense in depth:**
@@ -81,7 +81,7 @@ Then check your setup:
 | `/agy:status [job-id]` | List recent jobs, or show one job (add `--wait` to block until done). |
 | `/agy:result [job-id]` | Print the stored final output of a finished job. |
 | `/agy:cancel [job-id]` | Cancel a running background job (kills `agy`'s process group cleanly). |
-| `/agy:setup [--web on\|off]` | Check that `agy` is installed, authenticated, and provisioned with the read-only agents. `--web on\|off` saves the web-access default. |
+| `/agy:setup [--web on\|off]` | Check that `agy` is installed, authenticated, and provisioned with the read-only agents. `--web on\|off` saves the web-access default (off unless you turn it on). |
 
 ### Common flags
 
@@ -97,16 +97,43 @@ Then check your setup:
 
 ### Web access
 
-On by default for consults and reviews. agy gets `search_web` and `read_url_content`, and the run passes `--settings '{"permissions":{"allow":["read_url(*)"]}}'` because headless agy otherwise auto-denies page fetches. That rule lives only for the run and is never written to your agy `settings.json`.
+Off by default: agy sees only the repository. Turn it on when you want agy to search the web or read a page (docs, changelogs, issues).
+
+**How to turn web on**
+
+- For one run, add `--web`:
+
+  ```text
+  /agy:consult --web -- what changed in the latest Node.js LTS?
+  /agy:review --web
+  ```
+
+- For every run, in every workspace:
+
+  ```text
+  /agy:setup --web on
+  ```
+
+  `/agy:setup --web off` switches it back. Plain `/agy:setup` shows the current state and where it comes from (`default`, `setup` or `AGY_PLUGIN_WEB`).
+
+- Through the environment, e.g. in `~/.claude/settings.json`:
+
+  ```json
+  { "env": { "AGY_PLUGIN_WEB": "on" } }
+  ```
+
+- When asking through the `agy-consult` subagent or `/agy:rescue`, just say you want agy to look it up online; it passes `--web`.
+
+With web on, agy gets `search_web` and `read_url_content`, and the run passes `--settings '{"permissions":{"allow":["read_url(*)"]}}'` because headless agy otherwise auto-denies page fetches. That rule lives only for the run and is never written to your agy `settings.json`.
 
 Precedence, highest first:
 
 1. `--web` / `--no-web` on the command.
 2. `AGY_PLUGIN_WEB=on|off` (e.g. in `~/.claude/settings.json` `"env"`).
 3. `/agy:setup --web on|off`, saved in `~/.claude-agy/companion/settings.json` for every workspace.
-4. On.
+4. Off.
 
-The trade-off: a page agy reads, or text planted in the code under review, could steer it into fetching a URL that carries repository content in the query string. agy still cannot write files or run commands, but if you review untrusted code, use `--no-web` or switch the default off.
+The trade-off: a page agy reads, or text planted in the code under review, could steer it into fetching a URL that carries repository content in the query string. agy still cannot write files or run commands, which is why it is off by default. If you turn it on globally, use `--no-web` when reviewing untrusted code.
 
 ---
 

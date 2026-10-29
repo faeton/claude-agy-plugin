@@ -436,7 +436,8 @@ console.log("\nprofiles, effort, timeout message, custom-agent validation");
   check("web agent is refused with web off", /web tool/.test(p(m.WEB_AGENT_MARKDOWN) ?? ""));
 
   delete process.env.AGY_PLUGIN_WEB;
-  check("web is on by default", m.resolveWeb(null, undefined).web === true);
+  check("web is off by default", m.resolveWeb(null, undefined).web === false);
+  check("saved setup setting turns web on", m.resolveWeb(null, true).web === true);
   check("saved setup setting turns web off", m.resolveWeb(null, false).web === false);
   process.env.AGY_PLUGIN_WEB = "off";
   check("AGY_PLUGIN_WEB beats the saved setting", m.resolveWeb(null, true).web === false);
