@@ -57,17 +57,17 @@ const MODEL_PROBE_TIMEOUT_MS = 10_000;
 const MODEL_EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/i;
 
 // The model, chosen as a named profile; effort is baked into agy model ids.
-// Measured on the same planted-bug review prompts as the grok plugin
-// (2026-10-19, agy 1.4.2, with the read-only agent and working-method prompt):
-// argon low found every planted bug in 50-65s and ~2.5 min on a large consult;
-// flash low was about twice as fast but missed or invented bugs on the harder
-// diffs; argon medium took 2-10 minutes for the same recall. With no model
-// default the run inherited agy's own default (and its `--effort medium`), the
-// slow configuration.
+// Measured on a planted-bug working-tree review (2026-11-23, agy 1.5.16, 6
+// changed files, 5 bugs and a correct decoy, 3 runs each): neon low found all
+// five in 43-59s, argon low (the previous default) found the same in 75-86s,
+// neon medium took 81-102s and was the only one to also open the broken caller
+// in a file the diff did not touch. Carbon low took 128s for the same findings.
+// Flash low and hydrogen low answered in 15-20s from the diff alone, without
+// reading the unchanged consumer of a changed constant.
 export const PROFILES = {
-  balanced: { model: "gemini-4-argon-low" },
+  balanced: { model: "gemini-4-neon-low" },
   fast: { model: "gemini-3.8-flash-low" },
-  deep: { model: "gemini-4-argon-medium" },
+  deep: { model: "gemini-4-neon-medium" },
 };
 export const DEFAULT_PROFILE = "balanced";
 
@@ -92,9 +92,13 @@ export function resolveModel(model, profile) {
   return m === "default" ? null : m;
 }
 
-function resolveEffort(effort, profile) {
+// AGY_PLUGIN_EFFORT is a default, so it yields to anything typed for this run:
+// an explicit --profile, or an explicit --model that names its own effort.
+function resolveEffort(effort, model, profile) {
+  if (effort) return effort;
   const p = resolveProfile(profile);
-  return effort || (p.explicit ? null : process.env.AGY_PLUGIN_EFFORT || null);
+  if (p.explicit || (model && MODEL_EFFORT_SUFFIX.test(model))) return null;
+  return process.env.AGY_PLUGIN_EFFORT || null;
 }
 
 // The custom Markdown-defined read-only agents provisioned into
@@ -106,8 +110,17 @@ function resolveEffort(effort, profile) {
 // agy's `search_web` and `read_url_content` for runs with web access on.
 export const DEFAULT_READONLY_AGENT = "claude-agy-readonly";
 export const DEFAULT_WEB_AGENT = "claude-agy-readonly-web";
+//
+// agy 1.5 folded search and listing into `run_command`, which these agents turn
+// off: the four names below still resolve, but the model is only handed
+// `read_file` (the new name of `view_file`), plus `search_web` on the web agent.
+// The names are kept so an older agy still gets its search tools; the prompts
+// carry a repository file list instead (see git.mjs) and never assume a search
+// tool exists.
 export const READONLY_TOOLS = ["view_file", "grep_search", "list_dir", "find_by_name"];
 export const WEB_TOOLS = ["search_web", "read_url_content"];
+// Also accepted in a custom agent: `read_file` is `view_file` under its new name.
+const READONLY_TOOL_ALIASES = ["read_file"];
 
 function agentMarkdown(name, tools, body) {
   return `---
@@ -129,13 +142,13 @@ You are a read-only code reviewer and technical consultant. ${body} You cannot r
 export const READONLY_AGENT_MARKDOWN = agentMarkdown(
   DEFAULT_READONLY_AGENT,
   READONLY_TOOLS,
-  "You can inspect the repository with view_file, grep_search, list_dir, and find_by_name.",
+  "You can read files in the repository with the file tools you have been given.",
 );
 
 export const WEB_AGENT_MARKDOWN = agentMarkdown(
   DEFAULT_WEB_AGENT,
   [...READONLY_TOOLS, ...WEB_TOOLS],
-  "You can inspect the repository with view_file, grep_search, list_dir, and find_by_name, and look things up on the web with search_web and read_url_content.",
+  "You can read files in the repository with the file tools you have been given, and look things up on the web with the web tools you have been given.",
 );
 
 // Web access: off unless switched on. Precedence, highest first: --web /
@@ -178,7 +191,7 @@ export function readOnlyAgentProblem(markdown, { web = false } = {}) {
     .split(/\r?\n/)
     .map((l) => l.replace(/^\s*-\s*/, "").replace(/["']/g, "").trim())
     .filter(Boolean);
-  const allowed = web ? [...READONLY_TOOLS, ...WEB_TOOLS] : READONLY_TOOLS;
+  const allowed = [...READONLY_TOOLS, ...READONLY_TOOL_ALIASES, ...(web ? WEB_TOOLS : [])];
   const extra = tools.filter((t) => !allowed.includes(t));
   if (extra.length) {
     const webOnly = extra.every((t) => WEB_TOOLS.includes(t));
@@ -404,28 +417,39 @@ export function modelSupportsReasoningEffort(modelId) {
   }
 }
 
-// Build the effort-related argv. Returns { args, dropped } where dropped is a
-// message or null. Profiles carry no effort (it is in the model id), so the flag
-// is only sent for an explicit --effort or AGY_PLUGIN_EFFORT, and never when the
-// model id already bakes one in unless --effort was passed explicitly.
+// Decide the model and effort a run sends. Returns { model, effort, args,
+// dropped }: `model` is the id for `--model` (null = send none), `args` the
+// effort argv, `effort` the level in force (for the job record), `dropped` a
+// message or null.
+//
+// agy model ids carry their effort (`gemini-4-neon-low`), and agy refuses a
+// suffixed id together with a different `--effort` ("--model gemini-4-argon-low
+// conflicts with --effort=high"). So an effort for a suffixed model is applied
+// by swapping the suffix, and `--effort` is only sent for a model id without one.
 export function effortArgs({ effort, reasoningEffort, model, profile }) {
   const explicit = Boolean(effort || reasoningEffort);
   const resolvedModel = resolveModel(model, profile);
-  if (!explicit && resolvedModel && MODEL_EFFORT_SUFFIX.test(resolvedModel)) {
-    return { args: [], dropped: null };
-  }
-  let level = resolveEffort(effort || reasoningEffort, profile);
+  let level = resolveEffort(effort || reasoningEffort, model, profile);
   if (level === "default") level = null;
-  if (!level) return { args: [], dropped: null };
+  const baked = resolvedModel ? MODEL_EFFORT_SUFFIX.exec(resolvedModel)?.[1].toLowerCase() : null;
+  if (baked) {
+    if (!level) return { model: resolvedModel, effort: baked, args: [], dropped: null };
+    const swapped = resolvedModel.replace(MODEL_EFFORT_SUFFIX, `-${level.toLowerCase()}`);
+    return { model: swapped, effort: level.toLowerCase(), args: [], dropped: null };
+  }
+  if (!level) return { model: resolvedModel, effort: null, args: [], dropped: null };
   const targetModel =
     resolvedModel ||
     (existsSync(resolve(AGY_HOME, "models_cache.json")) ? detectDefaultModel() : null);
   const supported = targetModel ? modelSupportsReasoningEffort(targetModel) : null;
-  if (supported !== false) return { args: ["--effort", level], dropped: null };
-  if (!explicit) return { args: [], dropped: null };
+  if (supported !== false) {
+    return { model: resolvedModel, effort: level, args: ["--effort", level], dropped: null };
+  }
   return {
+    model: resolvedModel,
+    effort: null,
     args: [],
-    dropped: `${targetModel} does not support reasoning effort — dropped --effort ${level}.`,
+    dropped: explicit ? `${targetModel} does not support reasoning effort — dropped --effort ${level}.` : null,
   };
 }
 
@@ -702,7 +726,17 @@ export function runAgy(args, options = {}) {
     }
     if (!child) return;
     activeChildren.add(child);
-    onSpawn?.({ pid: child.pid });
+    // A reporting failure (the job-state lock timing out, a full disk) must not
+    // throw out of here or out of the stdout handler below: that would kill this
+    // process and leave the detached agy running with nobody supervising it.
+    const report = (fn, arg) => {
+      try {
+        fn?.(arg);
+      } catch {
+        /* progress reporting is best-effort */
+      }
+    };
+    report(onSpawn, { pid: child.pid });
 
     let stdout = "";
     let stderr = "";
@@ -769,7 +803,7 @@ export function runAgy(args, options = {}) {
         if ((su?.step_type === "tool" && su.state === "DONE") || event?.type === "tool_call") {
           activity.toolCalls++;
         }
-        onProgress?.(event);
+        report(onProgress, event);
       }
     });
 

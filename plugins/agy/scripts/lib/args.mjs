@@ -113,20 +113,20 @@ export function splitRawArgumentString(raw) {
       return tokens;
     }
 
+    // This is prose as often as it is flags, so it is not full shell syntax:
+    // - a quote only opens at the start of a token or right after `=`
+    //   (`--question="a b"`), and only if a closing quote follows, so the
+    //   apostrophe in "doesn't" stays an apostrophe;
+    // - a backslash only escapes a quote, a space or another backslash, so
+    //   `C:\temp` and `\d+` keep theirs.
     let token = "";
     let quote = null;
-    let escaped = false;
     while (i < n) {
       const ch = text[i];
-      if (escaped) {
-        token += ch;
-        escaped = false;
-        i++;
-        continue;
-      }
-      if (ch === "\\" && quote !== "'") {
-        escaped = true;
-        i++;
+      const next = text[i + 1];
+      if (ch === "\\" && quote !== "'" && next !== undefined && /["'\\\s]/.test(next)) {
+        token += next;
+        i += 2;
         continue;
       }
       if (quote) {
@@ -135,7 +135,11 @@ export function splitRawArgumentString(raw) {
         i++;
         continue;
       }
-      if (ch === '"' || ch === "'") {
+      if (
+        (ch === '"' || ch === "'") &&
+        (token === "" || token.endsWith("=")) &&
+        text.indexOf(ch, i + 1) !== -1
+      ) {
         quote = ch;
         i++;
         continue;

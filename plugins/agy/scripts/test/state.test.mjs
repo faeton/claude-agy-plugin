@@ -18,12 +18,12 @@ process.env.AGY_COMPANION_HOME = join(DIR, "companion");
 delete process.env.AGY_COMPANION_SESSION_ID;
 
 const LIB = resolve(dirname(fileURLToPath(import.meta.url)), "..", "lib");
-const { parseArgs } = await import(join(LIB, "args.mjs"));
-const { collectReviewContext, resolveReviewTarget } = await import(join(LIB, "git.mjs"));
+const { parseArgs, splitRawArgumentString } = await import(join(LIB, "args.mjs"));
+const { buildConsultPrompt, collectReviewContext, resolveReviewTarget } = await import(join(LIB, "git.mjs"));
 const { createJob, reconcile, runTrackedJob, transition, START_GRACE_MS } = await import(
   join(LIB, "jobs.mjs")
 );
-const { listJobs, readJobFile, updateJob, withLock } = await import(join(LIB, "state.mjs"));
+const { listJobs, pruneJobs, readJobFile, updateJob, withLock } = await import(join(LIB, "state.mjs"));
 
 let failures = 0;
 function check(label, cond, got) {
@@ -99,6 +99,52 @@ const onlyQuoted = makeRepo("quoted");
 writeFileSync(join(onlyQuoted, "only new file.ts"), "content\n");
 ctx = collectReviewContext(onlyQuoted, { mode: "working-tree" });
 check("a tree whose only change is a quoted name is not 'empty'", ctx.empty === false, ctx);
+
+// Untracked files are found from the top level, not just under cwd.
+const nested = makeRepo("nested");
+mkdirSync(join(nested, "sub"));
+writeFileSync(join(nested, "elsewhere.ts"), "outside the subdirectory\n");
+ctx = collectReviewContext(join(nested, "sub"), { mode: "working-tree" });
+check("an untracked file outside cwd is reviewed", ctx.empty === false && ctx.content.includes("outside the subdirectory"), ctx);
+
+// A file containing a code fence cannot close its own block.
+const fenced = makeRepo("fenced");
+writeFileSync(join(fenced, "notes.md"), "before\n```\ninside\n```\nafter\n");
+ctx = collectReviewContext(fenced, { mode: "working-tree" });
+check("an untracked file with ``` gets a longer fence", /Untracked file notes\.md:\n````\nbefore/.test(ctx.content), ctx.content);
+
+// The prompt carries the repository file list (agy 1.5 has no search tool).
+check("review context lists repository files", /Repository files \(paths relative to [^\n]*\):\n```\na\.txt\nnotes\.md\n```/.test(ctx.content), ctx.content);
+{
+  const consult = buildConsultPrompt({ question: "q?", cwd: fenced });
+  check("consult prompt lists repository files", /Repository files[^\n]*\n```\na\.txt\nnotes\.md/.test(consult), consult);
+  const outside = buildConsultPrompt({ question: "q?", cwd: DIR });
+  check("consult outside a repository has no file list", !outside.includes("Repository files"), outside);
+  check("--file pointing at a directory is refused", throws(() => buildConsultPrompt({ question: "q?", files: ["."], cwd: fenced }), /regular file/), null);
+}
+
+// Slash-command blobs are prose as often as flags.
+{
+  const one = (s) => splitRawArgumentString(s);
+  check("an apostrophe inside a word is kept", one("why doesn't it work").join(" ") === "why doesn't it work", one("why doesn't it work"));
+  check("a backslash before a letter is kept", one("path C:\\temp and \\d+").join(" ") === "path C:\\temp and \\d+", one("path C:\\temp and \\d+"));
+  check("a quoted value is still one token", one('--question "a b" --json').join("|") === "--question|a b|--json", one('--question "a b" --json'));
+  check("--flag=\"quoted value\" is one token", one('--question="a b"').join("|") === "--question=a b", one('--question="a b"'));
+  check("an unclosed quote is literal", one("'tis fine").join(" ") === "'tis fine", one("'tis fine"));
+}
+
+// Old finished jobs are pruned; active ones never are.
+{
+  const pws = join(DIR, "prune-ws");
+  mkdirSync(pws);
+  const mk = (i, status) => updateJob(pws, `job-${i}`, () => ({ status, createdAt: new Date(2026, 0, 1, 0, i).toISOString() }));
+  for (let i = 0; i < 6; i++) mk(i, "completed");
+  mk(6, "running");
+  const removed = pruneJobs(pws, 2);
+  const left = listJobs(pws).map((j) => j.id).sort();
+  check("prune drops the oldest finished jobs only", removed === 4 && left.length === 3 && left.includes("job-6"), { removed, left });
+  check("a pruned job's record is deleted", readJobFile(pws, "job-0") === null, null);
+}
 
 check(
   "--base starting with - is rejected",

@@ -15,6 +15,7 @@ import {
   readFileSync,
   writeFileSync,
   renameSync,
+  linkSync,
   openSync,
   closeSync,
   unlinkSync,
@@ -120,10 +121,22 @@ export function withLock(lockPath, fn, { timeoutMs = 5_000, waitMs = 10, maxAgeM
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
     }
-    if (lockIsStale(lockPath, maxAgeMs)) {
+    const stale = staleLockToken(lockPath, maxAgeMs);
+    if (stale) {
       const aside = `${lockPath}.stale.${process.pid}.${Math.random().toString(36).slice(2)}`;
       try {
         renameSync(lockPath, aside);
+        // Between judging the lock stale and renaming it, another contender may
+        // have reclaimed it and taken a fresh lock, in which case the file just
+        // moved is THEIR live lock. Compare it with what was judged stale and
+        // put a live one back (link fails harmlessly if a lock exists again).
+        if (lockToken(aside) !== stale) {
+          try {
+            linkSync(aside, lockPath);
+          } catch {
+            /* someone else holds the path now */
+          }
+        }
         unlinkSync(aside);
       } catch {
         /* another contender reclaimed it first */
@@ -147,15 +160,51 @@ export function withLock(lockPath, fn, { timeoutMs = 5_000, waitMs = 10, maxAgeM
   }
 }
 
-function lockIsStale(lockPath, maxAgeMs) {
+// Identifies one particular lock file: its inode, creation stamp and owner.
+function lockToken(lockPath) {
+  const st = statSync(lockPath);
+  return `${st.ino}:${st.mtimeMs}:${readFileSync(lockPath, "utf8").trim()}`;
+}
+
+// The token of a stale lock (dead owner, or older than maxAgeMs), else null.
+function staleLockToken(lockPath, maxAgeMs) {
   try {
-    if (Date.now() - statSync(lockPath).mtimeMs > maxAgeMs) return true;
+    const token = lockToken(lockPath);
+    if (Date.now() - statSync(lockPath).mtimeMs > maxAgeMs) return token;
     const owner = Number(readFileSync(lockPath, "utf8").trim());
     // An empty file is a holder between open and write: not stale.
-    return Number.isInteger(owner) && owner > 0 && !pidAlive(owner);
+    return Number.isInteger(owner) && owner > 0 && !pidAlive(owner) ? token : null;
   } catch {
-    return false; // vanished: the next open attempt will tell
+    return null; // vanished: the next open attempt will tell
   }
+}
+
+// Finished jobs kept per workspace; older ones lose their record and log.
+export const MAX_FINISHED_JOBS = 50;
+
+// Drop the oldest finished jobs beyond `keep`. Active jobs are never touched.
+export function pruneJobs(workspaceRoot, keep = MAX_FINISHED_JOBS) {
+  return withLock(stateLockPath(workspaceRoot), () => {
+    const path = indexPath(workspaceRoot);
+    const index = readJson(path, { jobs: {} });
+    const stamp = (j) => Date.parse(j.updatedAt ?? j.createdAt ?? 0) || 0;
+    const finished = Object.values(index.jobs ?? {})
+      .filter((j) => j.status !== "queued" && j.status !== "running")
+      .sort((a, b) => stamp(b) - stamp(a));
+    const doomed = finished.slice(keep);
+    for (const j of doomed) {
+      for (const file of [jobFilePath(workspaceRoot, j.id), logFilePath(workspaceRoot, j.id)]) {
+        try {
+          unlinkSync(file);
+        } catch {
+          /* already gone */
+        }
+      }
+      delete index.jobs[j.id];
+    }
+    if (doomed.length) writeJson(path, index);
+    return doomed.length;
+  });
 }
 
 function busyWait(ms) {

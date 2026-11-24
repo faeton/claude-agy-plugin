@@ -7,7 +7,8 @@
 // `claude-agy-readonly` by default, or `claude-agy-readonly-web` when web
 // access is switched on (`--web`, AGY_PLUGIN_WEB, `/agy:setup --web on`). Both restrict `agy` to an explicit
 // read-only allowlist (`view_file`, `grep_search`, `list_dir`, `find_by_name`,
-// plus `search_web` / `read_url_content` for the web agent), set
+// plus `search_web` / `read_url_content` for the web agent; agy 1.5 hands the
+// model only `read_file` and `search_web` of these, see lib/agy.mjs), set
 // `commandExecutionPolicy: "off"` and `subagent: false`, and trim the system
 // prompt down to 2 sentences (~2x-3x faster responses). Runs also pass `--sandbox`, `--disable-slash-commands`,
 // and `--output-format stream-json`, bounded by both an idle timer and a
@@ -26,7 +27,7 @@
 //   cancel [job-id] [--json]
 
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -48,7 +49,6 @@ import {
   parseWebSetting,
   getAgyAvailability,
   readOnlyArgs,
-  resolveModel,
   resolveProfile,
   resolveWeb,
   runAgy,
@@ -92,9 +92,17 @@ import {
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const LOG_PATH = join(ROOT, "companion.jsonl");
 
+// The invocation log is kept to about 2 MB: one previous file, then dropped.
+const LOG_MAX_BYTES = 1_000_000;
+
 function logEvent(event) {
   try {
     mkdirSync(dirname(LOG_PATH), { recursive: true });
+    try {
+      if (statSync(LOG_PATH).size > LOG_MAX_BYTES) renameSync(LOG_PATH, `${LOG_PATH}.1`);
+    } catch {
+      /* no log yet */
+    }
     appendFileSync(
       LOG_PATH,
       JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...event }) + "\n",
@@ -221,13 +229,6 @@ async function handleSetup(argv) {
     }
   }
   const sandbox = sandboxAvailability();
-  if (!sandbox.available) {
-    nextSteps.push(
-      sandbox.required
-        ? "Install bubblewrap (`bwrap`) or put a standalone binary on PATH — AGY_COMPANION_REQUIRE_SANDBOX=1 makes runs fail without it."
-        : "Optional: install bubblewrap (`bwrap`) so agy runs under its OS sandbox; without it runs proceed unsandboxed with a warning.",
-    );
-  }
   const ready =
     agy.available &&
     auth.loggedIn &&
@@ -290,7 +291,7 @@ async function runConsult(req, progress) {
     ...readOnlyArgs({ web, sandbox: sandbox.available || sandbox.required, agent: agent.name }),
     ...eff.args,
   ];
-  const model = resolveModel(req.model, req.profile);
+  const model = eff.model;
   if (model) args.push("--model", model);
 
   progress?.({ phase: "asking", message: `Sending question to agy (web ${web ? "on" : "off"})…` });
@@ -321,7 +322,7 @@ async function runConsult(req, progress) {
       sessionId: result.sessionId,
       model,
       profile: resolveProfile(req.profile).name,
-      effort: eff.args[1] ?? null,
+      effort: eff.effort,
       web,
       toolCalls: result.toolCalls,
       warning: result.warning,
@@ -361,7 +362,22 @@ async function handleConsult(argv) {
 
   installCancelHandlers(workspaceRoot, job.id);
   const execution = await runTrackedJob(job, (progress) => runConsult(req, progress));
-  out(execution.payload, req.json, execution.rendered);
+  finishForeground(job, execution, req.json);
+}
+
+// runTrackedJob returns null when the job stopped being queued before it could
+// start (a cancel landed between createJob and the run).
+function finishForeground(job, execution, asJson) {
+  if (!execution) {
+    out(
+      { jobId: job.id, status: "cancelled", ok: false },
+      asJson,
+      `[agy] ${job.title} (${job.id}) was cancelled before it started.\n`,
+    );
+    process.exitCode = 130;
+    return;
+  }
+  out(execution.payload, asJson, execution.rendered);
   if (!execution.ok) process.exitCode = execution.exitCode || 1;
 }
 
@@ -405,12 +421,13 @@ async function runReview(req, kind, progress) {
   const target = resolveReviewTarget(req.cwd, { base: req.base, scope: req.scope });
   const context = collectReviewContext(req.cwd, target);
   if (context.empty) {
+    // Nothing to review is an answer, not a failure: the job completes and the
+    // command exits 0 (it used to be stored as failed and exit 1).
     return {
-      ok: false,
+      ok: true,
       exitCode: 0,
-      errorMessage: "No changes detected to review.",
       summary: "nothing to review",
-      payload: { ok: false, errorMessage: "No changes detected to review.", target },
+      payload: { ok: true, empty: true, text: "No changes detected to review.", target },
       rendered: "[agy] No changes detected to review.\n",
     };
   }
@@ -432,7 +449,7 @@ async function runReview(req, kind, progress) {
     ...readOnlyArgs({ web, sandbox: sandbox.available || sandbox.required, agent: agent.name }),
     ...eff.args,
   ];
-  const model = resolveModel(req.model, req.profile);
+  const model = eff.model;
   if (model) args.push("--model", model);
 
   progress?.({ phase: "reviewing", message: `Reviewing ${target.label} (web ${web ? "on" : "off"})…` });
@@ -464,7 +481,7 @@ async function runReview(req, kind, progress) {
       sessionId: result.sessionId,
       model,
       profile: resolveProfile(req.profile).name,
-      effort: eff.args[1] ?? null,
+      effort: eff.effort,
       web,
       toolCalls: result.toolCalls,
       warning: result.warning,
@@ -506,8 +523,7 @@ async function handleReview(argv, kind = "review") {
 
   installCancelHandlers(workspaceRoot, job.id);
   const execution = await runTrackedJob(job, (progress) => runReview(req, kind, progress));
-  out(execution.payload, req.json, execution.rendered);
-  if (!execution.ok) process.exitCode = execution.exitCode || 1;
+  finishForeground(job, execution, req.json);
 }
 
 // ---------- background worker ----------
@@ -738,11 +754,12 @@ function usage() {
     "  agy-companion.mjs result [job-id] [--json]",
     "  agy-companion.mjs cancel [job-id] [--json]",
     "",
-    "  --profile     balanced (gemini-4-argon-low; default), fast (gemini-3.8-flash-low) or deep",
-    "                (gemini-4-argon-medium). Default $AGY_PLUGIN_PROFILE or balanced.",
+    "  --profile     balanced (gemini-4-neon-low; default), fast (gemini-3.8-flash-low) or deep",
+    "                (gemini-4-neon-medium). Default $AGY_PLUGIN_PROFILE or balanced.",
     "  --model       agy model id, overrides the profile ($AGY_PLUGIN_MODEL; 'default' = CLI's own).",
-    "  --effort      reasoning effort, overrides the profile ($AGY_PLUGIN_EFFORT; 'default' = CLI's own).",
-    "  --web         let agy use search_web / read_url_content (default off). --no-web turns it off",
+    "  --effort      reasoning effort ($AGY_PLUGIN_EFFORT; 'default' = the model's own). Swaps the effort",
+    "                suffix of the model id: --effort high on the default profile runs gemini-4-neon-high.",
+    "  --web         let agy search the web (default off; agy 1.5 cannot open a given URL). --no-web turns it off",
     "                for one run; setup --web on|off saves the default; $AGY_PLUGIN_WEB overrides that.",
     "  --timeout-ms  wall-clock backstop (default 8m).",
     "  --idle-ms     kill after this long with no output at all (default 3m, 0 disables).",

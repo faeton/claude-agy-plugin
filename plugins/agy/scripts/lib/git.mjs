@@ -1,7 +1,7 @@
 // Git helpers + review/consult prompt construction.
 
 import { spawnSync } from "node:child_process";
-import { closeSync, existsSync, fstatSync, lstatSync, openSync, readSync, readlinkSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, lstatSync, openSync, readSync, readlinkSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
 const MAX_FILE_BYTES = 200_000;
@@ -190,7 +190,49 @@ function describeUntracked(cwd, f, budget) {
   }
   const { body, binary } = readHead(abs, MAX_FILE_BYTES);
   if (binary) return { text: `Untracked file ${f}: (binary, skipped)`, bytes: 0 };
-  return { text: [`Untracked file ${f}:`, "```", body, "```"].join("\n"), bytes: st.size };
+  const fc = fence(body);
+  return { text: [`Untracked file ${f}:`, fc, body, fc].join("\n"), bytes: st.size };
+}
+
+// The repository's file list, for the prompt. agy 1.5 gives the read-only agent
+// no search or directory-listing tool (only `read_file`), so without this the
+// model cannot find the callers of a changed function: every benchmark review
+// ended with "could not search the repository". Tracked plus untracked,
+// ignored files left out. Capped, with the paths nearest the changed files kept
+// first when the repository is larger than the cap.
+const MAX_LISTED_FILES = 1500;
+const MAX_LISTED_BYTES = 40_000;
+
+export function repoFilesSection(cwd, near = []) {
+  const top = git(["rev-parse", "--show-toplevel"], { cwd });
+  if (!top.ok) return null;
+  const root = top.stdout.trim();
+  const listed = git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: root });
+  if (!listed.ok) return null;
+  const all = [...new Set(nulList(listed.stdout))];
+  if (!all.length) return null;
+  const dirOf = (p) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "");
+  const nearDirs = new Set(near.map(dirOf));
+  const nearTops = new Set(near.map((p) => p.split("/")[0]));
+  const rank = (p) => (nearDirs.has(dirOf(p)) ? 0 : nearTops.has(p.split("/")[0]) ? 1 : 2);
+  const ordered = all.map((p, i) => ({ p, i, r: rank(p) })).sort((a, b) => a.r - b.r || a.i - b.i);
+  const kept = [];
+  let bytes = 0;
+  for (const { p } of ordered) {
+    if (kept.length >= MAX_LISTED_FILES || bytes + p.length + 1 > MAX_LISTED_BYTES) break;
+    kept.push(p);
+    bytes += p.length + 1;
+  }
+  kept.sort();
+  const body = kept.join("\n");
+  const fc = fence(body);
+  const more = all.length - kept.length;
+  return [
+    `Repository files (paths relative to ${root}${more > 0 ? `; ${more} more not listed` : ""}):`,
+    fc,
+    body,
+    fc,
+  ].join("\n");
 }
 
 // A code fence longer than any backtick run in the body, so a file that itself
@@ -289,12 +331,14 @@ export function collectReviewContext(cwd, target) {
     if (log.trim()) {
       sections.push("", "Commits on this branch:", "```", log.trim(), "```");
     }
-    sections.push("", "Diff:", "```diff", diff.trim() || "(no diff)", "```");
+    sections.push("", "Diff:", ...fencedDiff(diff.trim() || "(no diff)"));
     const files = nulList(
       gitOrThrow(["diff", "--name-only", "-z", "--diff-filter=d", "--end-of-options", `${base}...HEAD`], cwd),
     );
     const full = changedFilesSection(cwd, target, files);
     if (full) sections.push("", full);
+    const listing = diff.trim() ? repoFilesSection(cwd, files) : null;
+    if (listing) sections.push("", listing);
     return { content: sections.join("\n"), empty: !diff.trim() };
   }
 
@@ -312,25 +356,39 @@ export function collectReviewContext(cwd, target) {
   // -z: NUL-separated and unquoted. Without it git C-quotes names containing
   // spaces, tabs, newlines or non-ASCII bytes, and those quoted strings are not
   // real paths — such files silently vanished from the review.
+  //
+  // Listed from the top level: `git ls-files --others` only covers the directory
+  // it runs in, while the diff and the dirty check are repository-wide, so a
+  // review started in a subdirectory used to miss untracked files elsewhere (and
+  // could report "no changes" for a tree whose only change was one of them).
   let hasUntracked = false;
   const budget = { left: MAX_UNTRACKED_BYTES };
-  const untracked = gitOrThrow(["ls-files", "-z", "--others", "--exclude-standard"], cwd);
-  for (const f of untracked.split("\0").filter(Boolean)) {
-    const section = describeUntracked(cwd, f, budget);
+  const top = gitOrThrow(["rev-parse", "--show-toplevel"], cwd).trim();
+  const untracked = nulList(gitOrThrow(["ls-files", "-z", "--others", "--exclude-standard"], top));
+  for (const f of untracked) {
+    const section = describeUntracked(top, f, budget);
     if (!section) continue;
     hasUntracked = true;
     budget.left -= section.bytes;
     sections.push("", section.text);
   }
 
-  sections.push("", "Diff:", "```diff", diff.trim() || "(no tracked diff)", "```");
+  sections.push("", "Diff:", ...fencedDiff(diff.trim() || "(no tracked diff)"));
   const changed = new Set([
     ...nulList(gitOrThrow(["diff", "--cached", "--name-only", "-z", "--diff-filter=d"], cwd)),
     ...nulList(gitOrThrow(["diff", "--name-only", "-z", "--diff-filter=d"], cwd)),
   ]);
   const full = changedFilesSection(cwd, target, [...changed]);
   if (full) sections.push("", full);
-  return { content: sections.join("\n"), empty: !diff.trim() && !hasUntracked };
+  const empty = !diff.trim() && !hasUntracked;
+  const listing = empty ? null : repoFilesSection(cwd, [...changed, ...untracked]);
+  if (listing) sections.push("", listing);
+  return { content: sections.join("\n"), empty };
+}
+
+function fencedDiff(diff) {
+  const fc = fence(diff);
+  return [`${fc}diff`, diff, fc];
 }
 
 const REVIEW_HEADER = [
@@ -353,9 +411,11 @@ const REVIEW_HEADER = [
 // Benchmarked against both: same findings as the uncapped run, in about a minute.
 export const REVIEW_METHOD =
   "Working method: review every changed hunk, using the diff and any full files above as primary " +
-  "evidence; files shown in full need no view_file. For each " +
+  "evidence; files shown in full need no re-reading. For each " +
   "change, check what depends on it: callers, consumers of changed values, strings, defaults or " +
-  "return codes, and the invariants the surrounding code relies on. Read the code you need for that " +
+  "return codes, and the invariants the surrounding code relies on. If you have no search tool, " +
+  "pick the files that could depend on a change from the repository file list above and read them. " +
+  "Read the code you need for that " +
   "and nothing else: aim for at most 6 investigation steps, batch independent reads into one step, " +
   "read whole functions instead of paging, never re-read the same range, and do not survey unrelated " +
   "implementations. Then write the final answer; list anything you could not verify.";
@@ -364,7 +424,8 @@ export const REVIEW_METHOD =
 // the same economy without the per-hunk coverage rule.
 export const CONSULT_METHOD =
   "Working method: treat the question and any attached files above as primary evidence. Read other " +
-  "files only where the answer depends on them: batch independent reads into one step, read whole " +
+  "files only where the answer depends on them (if you have no search tool, pick them from the " +
+  "repository file list above): batch independent reads into one step, read whole " +
   "functions instead of paging, never re-read the same range, and do not survey unrelated code. Then " +
   "write the final answer; list anything you could not verify.";
 
@@ -387,13 +448,21 @@ export function buildConsultPrompt({ question, files = [], cwd = process.cwd() }
     if (!existsSync(abs)) {
       throw new Error(`file not found: ${f}`);
     }
+    if (!statSync(abs).isFile()) {
+      throw new Error(`--file must be a regular file, not a directory: ${f}`);
+    }
     // An explicit --file is the user's choice, so symlinks are followed here,
     // but only the first MAX_FILE_BYTES are ever read.
-    const { size, body } = readHead(abs, MAX_FILE_BYTES);
+    const { size, body, binary } = readHead(abs, MAX_FILE_BYTES);
+    if (binary) throw new Error(`--file looks binary, so it was not attached: ${f}`);
     const clipped =
       size > MAX_FILE_BYTES ? body + `\n… (truncated, ${size} bytes total)` : body;
-    parts.push("", `--- ${f} ---`, "```", clipped, "```");
+    const fc = fence(clipped);
+    parts.push("", `--- ${f} ---`, fc, clipped, fc);
   }
+  // Outside a git repository there is no list; the question stands on its own.
+  const listing = repoFilesSection(cwd, files);
+  if (listing) parts.push("", listing);
   parts.push("", CONSULT_METHOD);
   return parts.join("\n");
 }

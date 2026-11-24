@@ -337,17 +337,26 @@ async function effortFor(name, req, env = {}) {
   return mod.effortArgs(req);
 }
 let e = await effortFor("default", {});
-check("default profile (argon-low) sends no --effort", e.args.length === 0, e);
+check("default profile (neon-low) sends no --effort", e.args.length === 0 && e.model === "gemini-4-neon-low" && e.effort === "low", e);
+// agy rejects a suffixed model id with a different --effort, so the suffix is swapped.
 e = await effortFor("explicit", { effort: "high" });
-check("explicit effort wins", e.args.join(" ") === "--effort high", e);
+check("explicit effort swaps the model suffix, no --effort flag", e.args.length === 0 && e.model === "gemini-4-neon-high" && e.effort === "high", e);
 e = await effortFor("bakedmodel", { model: "gemini-4-argon-low" });
-check("model with baked-in effort suffix (-low) omits implicit --effort", e.args.length === 0, e);
+check("model with baked-in effort suffix (-low) omits implicit --effort", e.args.length === 0 && e.model === "gemini-4-argon-low", e);
 e = await effortFor("envset", { model: "default" }, { effort: "low" });
-check("AGY_PLUGIN_EFFORT applies when no suffixed model is chosen", e.args.join(" ") === "--effort low", e);
+check("AGY_PLUGIN_EFFORT applies when no suffixed model is chosen", e.args.join(" ") === "--effort low" && e.model === null, e);
+e = await effortFor("envswap", {}, { effort: "medium" });
+check("AGY_PLUGIN_EFFORT swaps the default profile's suffix", e.args.length === 0 && e.model === "gemini-4-neon-medium", e);
+e = await effortFor("envtyped", { model: "gemini-4-argon-low" }, { effort: "high" });
+check("AGY_PLUGIN_EFFORT yields to an explicit suffixed --model", e.model === "gemini-4-argon-low" && e.args.length === 0, e);
+e = await effortFor("envprofile", { profile: "fast" }, { effort: "high" });
+check("AGY_PLUGIN_EFFORT yields to an explicit --profile", e.model === "gemini-3.8-flash-low" && e.args.length === 0, e);
 e = await effortFor("envdefault", {}, { effort: "default" });
-check("AGY_PLUGIN_EFFORT=default sends no flag", e.args.length === 0 && !e.dropped, e);
-e = await effortFor("alias", { reasoningEffort: "low" });
-check("--reasoning-effort is sent once, as --effort", e.args.join(" ") === "--effort low", e);
+check("AGY_PLUGIN_EFFORT=default sends no flag", e.args.length === 0 && !e.dropped && e.model === "gemini-4-neon-low", e);
+e = await effortFor("alias", { reasoningEffort: "medium" });
+check("--reasoning-effort behaves like --effort", e.args.length === 0 && e.model === "gemini-4-neon-medium", e);
+e = await effortFor("plainmodel", { model: "m-yes", effort: "high" });
+check("an unsuffixed model gets --effort", e.args.join(" ") === "--effort high" && e.model === "m-yes", e);
 delete process.env.AGY_PLUGIN_EFFORT;
 
 // -------------------------------------------------------------------- timers
@@ -409,9 +418,9 @@ console.log("\nprofiles, effort, timeout message, custom-agent validation");
 {
   const m = await import(`${LIB}?case=profiles`);
   for (const k of ["AGY_PLUGIN_PROFILE", "AGY_PLUGIN_MODEL", "AGY_PLUGIN_EFFORT"]) delete process.env[k];
-  check("default profile is balanced (argon low)", m.resolveModel(null, null) === "gemini-4-argon-low", m.resolveModel(null, null));
+  check("default profile is balanced (neon low)", m.resolveModel(null, null) === "gemini-4-neon-low", m.resolveModel(null, null));
   check("--profile fast picks flash low", m.resolveModel(null, "fast") === "gemini-3.8-flash-low");
-  check("--profile deep picks argon medium", m.resolveModel(null, "deep") === "gemini-4-argon-medium");
+  check("--profile deep picks neon medium", m.resolveModel(null, "deep") === "gemini-4-neon-medium");
   check("--model overrides the profile", m.resolveModel("x-model", "deep") === "x-model");
   let threw = false;
   try { m.resolveProfile("nope"); } catch { threw = true; }
@@ -420,10 +429,12 @@ console.log("\nprofiles, effort, timeout message, custom-agent validation");
   check("AGY_PLUGIN_MODEL beats the default profile", m.resolveModel(null, null) === "env-model");
   check("an explicit --profile beats AGY_PLUGIN_MODEL", m.resolveModel(null, "fast") === "gemini-3.8-flash-low");
   delete process.env.AGY_PLUGIN_MODEL;
+  const p0 = m.readOnlyAgentProblem;
   const e = m.effortArgs({ effort: null, reasoningEffort: null, model: null, profile: null });
   check("suffixed profile model sends no --effort", e.args.length === 0, e);
   const e2 = m.effortArgs({ effort: "high", model: "gemini-4-argon-low" });
-  check("explicit --effort is still sent", e2.args.join(" ") === "--effort high", e2);
+  check("explicit --effort rewrites a suffixed --model", e2.args.length === 0 && e2.model === "gemini-4-argon-high", e2);
+  check("a custom agent may list read_file", p0(m.READONLY_AGENT_MARKDOWN.replace("  - view_file", "  - read_file")) === null);
   const t0 = m.timeoutMessage(480_000, { toolCalls: 0, lastEventAt: null });
   check("timeout with no events says so", /no output from agy/.test(t0), t0);
   const t1 = m.timeoutMessage(480_000, { toolCalls: 7, lastEventAt: 1_000 }, 31_000);

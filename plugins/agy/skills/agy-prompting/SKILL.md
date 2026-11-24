@@ -11,7 +11,7 @@ Use this skill when `agy:agy-consult` needs to tighten the user's request into a
 Principles:
 - One clear ask per run. Split unrelated questions into separate consults.
 - State what a good answer looks like (format, length, what to optimize for) instead of assuming `agy` will infer it.
-- Give `agy` the grounding it needs as `--file` context rather than pasting huge blobs into the question — the companion attaches files cleanly and caps their size, and `agy`'s read-only agent can also inspect repo files directly with `view_file`, `grep_search`, `list_dir`, and `find_by_name`.
+- Give `agy` the grounding it needs as `--file` context rather than pasting huge blobs into the question — the companion attaches files cleanly and caps their size, and `agy`'s read-only agent can also read repo files directly. On agy 1.5 it can only read files by path (no grep or directory listing); the companion puts the repository file list in the prompt, so name the files or symbols that matter when you know them.
 - For a second opinion, frame it adversarially: ask `agy` to find what is *wrong* or *risky*, not to agree. `agy` is most useful as an independent skeptic.
 
 Recipe for a consult:

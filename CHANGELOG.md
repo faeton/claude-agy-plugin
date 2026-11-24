@@ -2,6 +2,30 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.4.0] — 2026-11-23
+
+### Changed
+
+- **Default model is now Gemini 4 Neon.** `balanced` = `gemini-4-neon-low` (was `gemini-4-argon-low`), `deep` = `gemini-4-neon-medium` (was `gemini-4-argon-medium`); `fast` stays `gemini-3.8-flash-low`. On a planted-bug review (agy 1.5.16, 3 runs each) Neon low found the same five bugs as Argon low in 43-59s against 75-86s; Neon medium took 81-102s.
+- **Prompts carry the repository file list.** agy 1.5 no longer gives the read-only agent a search or directory-listing tool (the model only gets `read_file`), so reviews could not find callers in files the diff did not touch. Reviews and consults now include the tracked and untracked file list (capped at 1500 paths, nearest to the changed files first) and the working method tells the model to pick dependants from it.
+- The agent system prompts no longer name tools the model may not have. A custom `AGY_PLUGIN_AGENT` may list `read_file`.
+- A review with nothing to review completes and exits 0 (it was stored as failed and exited 1).
+- Finished jobs are kept to the newest 50 per workspace, and `companion.jsonl` is rotated at 1 MB.
+
+### Fixed
+
+- **`--effort` failed on every profile.** agy rejects a suffixed model id with a different `--effort` ("--model gemini-4-argon-low conflicts with --effort=high"). The effort now swaps the model id's suffix; the flag is only sent for an id without one. `AGY_PLUGIN_EFFORT` does the same for the default profile and yields to an explicit `--profile` or suffixed `--model`.
+- A review started in a subdirectory missed untracked files elsewhere in the repository, and could report "No changes detected".
+- A question passed as one argument lost its apostrophes and backslashes ("doesn't" became "doesnt", `C:\temp` became `C:temp`).
+- A progress update that failed (lock timeout, write error) threw inside the output handler, killing the worker and leaving agy running unsupervised.
+- A foreground run cancelled before it started crashed with a TypeError.
+- Reclaiming a stale state lock could remove another process's fresh lock.
+- Untracked files, `--file` attachments and the diff used a fixed code fence that their own content could close; `--file` on a directory or binary file now gives a clear error.
+
+### Known limits
+
+- **Web access is search only on agy 1.5.** The model gets `search_web` but not `read_url_content`, so it cannot open a URL you give it. Docs and command text now say so.
+
 ## [0.3.1] — 2026-10-30
 
 ### Changed

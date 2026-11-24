@@ -20,6 +20,7 @@ import {
   updateJob,
   listJobs,
   pidAlive,
+  pruneJobs,
 } from "./state.mjs";
 
 export const SESSION_ID_ENV = "AGY_COMPANION_SESSION_ID";
@@ -70,6 +71,11 @@ export function transition(workspaceRoot, jobId, from, patch) {
 }
 
 export function createJob({ workspaceRoot, kind, kindLabel, title, summary, prefix, request }) {
+  try {
+    pruneJobs(workspaceRoot);
+  } catch {
+    /* housekeeping must never block a new job */
+  }
   const id = generateJobId(prefix ?? "agy");
   const sessionId = currentSessionId();
   const logFile = logFilePath(workspaceRoot, id);
