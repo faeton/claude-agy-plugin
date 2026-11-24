@@ -152,8 +152,11 @@ export function withLock(lockPath, fn, { timeoutMs = 5_000, waitMs = 10, maxAgeM
     return fn();
   } finally {
     closeSync(fd);
+    // Release only a lock that is still ours. A holder suspended past maxAgeMs
+    // has had its lock reclaimed, and unlinking by path would then delete the
+    // next holder's lock.
     try {
-      unlinkSync(lockPath);
+      if (readFileSync(lockPath, "utf8").trim() === String(process.pid)) unlinkSync(lockPath);
     } catch {
       /* already gone */
     }
@@ -262,7 +265,7 @@ export function listJobs(workspaceRoot) {
 // snapshot taken earlier), then write the file and its index row together.
 // `mutate` returns null to leave the job untouched. Returns
 // { job, changed } where job is the record now on disk.
-export function updateJob(workspaceRoot, jobId, mutate) {
+export function updateJob(workspaceRoot, jobId, mutate, lockOptions) {
   return withLock(stateLockPath(workspaceRoot), () => {
     const current = readJobFile(workspaceRoot, jobId);
     const next = mutate(current);
@@ -275,7 +278,7 @@ export function updateJob(workspaceRoot, jobId, mutate) {
     index.jobs[jobId] = pickIndexFields(record);
     writeJson(path, index);
     return { job: record, changed: true };
-  });
+  }, lockOptions);
 }
 
 export function pidAlive(pid) {

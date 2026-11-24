@@ -61,14 +61,24 @@ export function appendLogBlock(logFile, title, body) {
 
 // Apply `patch` (an object, or a fn of the current record) only while the job's
 // status is one of `from`. Returns { job, changed }.
-export function transition(workspaceRoot, jobId, from, patch) {
+export function transition(workspaceRoot, jobId, from, patch, lockOptions) {
   const allowed = new Set(from);
-  return updateJob(workspaceRoot, jobId, (current) => {
-    if (!current || !allowed.has(current.status)) return null;
-    const delta = typeof patch === "function" ? patch(current) : patch;
-    return delta ? { ...current, ...delta } : null;
-  });
+  return updateJob(
+    workspaceRoot,
+    jobId,
+    (current) => {
+      if (!current || !allowed.has(current.status)) return null;
+      const delta = typeof patch === "function" ? patch(current) : patch;
+      return delta ? { ...current, ...delta } : null;
+    },
+    lockOptions,
+  );
 }
+
+// Progress updates run inside the child's stdout handler, so they must not sit
+// on a held lock for the full default timeout: a missed phase label is cheap,
+// a stalled output reader is not.
+const PROGRESS_LOCK = { timeoutMs: 500 };
 
 export function createJob({ workspaceRoot, kind, kindLabel, title, summary, prefix, request }) {
   try {
@@ -122,8 +132,14 @@ export async function runTrackedJob(job, runner, { onProgress } = {}) {
       const patch = {};
       if (event?.phase) patch.phase = event.phase;
       if (event?.agyPid) patch.agyPid = event.agyPid;
-      if (Object.keys(patch).length) transition(workspaceRoot, id, ["running"], patch);
       if (event?.message) appendLog(running.logFile, event.message);
+      if (Object.keys(patch).length) {
+        try {
+          transition(workspaceRoot, id, ["running"], patch, PROGRESS_LOCK);
+        } catch {
+          /* best-effort: the final transition records the outcome */
+        }
+      }
       onProgress?.(event);
     });
 

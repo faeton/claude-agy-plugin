@@ -2,6 +2,13 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.4.1] — 2026-11-23
+
+### Fixed
+
+- A process whose state lock had been reclaimed while it was suspended deleted the next holder's lock when it finished. A lock is now released only if it still holds the releasing process's pid.
+- A progress update that met a held state lock blocked the reader of agy's output for the full 5-second lock timeout. Progress updates now give up after 500 ms and are skipped.
+
 ## [0.4.0] — 2026-11-23
 
 ### Changed
